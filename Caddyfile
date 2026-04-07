@@ -1,0 +1,37 @@
+# Caddyfile — minimal HTTPS reverse proxy for the GRVT Grid stack.
+#
+# Replace `your-domain.example.com` with the domain you've pointed at this
+# host. Caddy will automatically obtain and renew a Let's Encrypt cert.
+#
+# WebSocket upgrade is handled transparently by reverse_proxy.
+
+your-domain.example.com {
+    # Optional: tighten with email so Let's Encrypt can warn you about issues
+    # tls you@example.com
+
+    # Bot dashboard + API + WebSocket
+    reverse_proxy bot:3848 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Security headers (basic — extend as needed)
+    header {
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer-when-downgrade"
+        # HSTS — once you're sure HTTPS works, uncomment:
+        # Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    # Logs
+    log {
+        output file /data/access.log {
+            roll_size 50mb
+            roll_keep 5
+        }
+    }
+}
+
+# Optional: redirect HTTP→HTTPS is the default, no extra config needed.
