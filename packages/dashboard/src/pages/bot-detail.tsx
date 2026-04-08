@@ -4,7 +4,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { Pause, Play } from 'lucide-react';
+import { Pause, Play, SlidersHorizontal, XCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '@/lib/api-client';
 import type {
@@ -34,6 +34,7 @@ import { Tabs } from '@/components/primitives/tabs';
 import { DataTable, type Column } from '@/components/primitives/data-table';
 import { EquityCurve } from '@/components/charts/equity-curve';
 import { StatsPanel } from '@/components/stats-panel';
+import { UpdateRangeDialog } from '@/components/update-range-dialog';
 import {
   FILL_FLASH_DURATION_MS,
   GridChart,
@@ -159,7 +160,22 @@ export function BotDetailPage() {
     onError: (err: Error) => toast.error(`Pause failed: ${err.message}`),
   });
 
+  const closeMutation = useMutation({
+    mutationFn: () => api.closeBot(botId),
+    onSuccess: () => {
+      toast.success(`Bot ${botId} closed (orders cancelled, position closed)`);
+      void queryClient.invalidateQueries({ queryKey: ['bot', botId] });
+      void queryClient.invalidateQueries({ queryKey: ['bots'] });
+      void queryClient.invalidateQueries({ queryKey: ['gridState', botId] });
+    },
+    onError: (err: Error) => toast.error(`Close failed: ${err.message}`),
+  });
+
   const confirm = useConfirm();
+
+  // Dialog state for the "Update range" action. Declared up here so the
+  // hook count is stable across early returns (Rules of Hooks).
+  const [rangeDialogOpen, setRangeDialogOpen] = useState(false);
 
   // ── Now safe to early-return ──
   if (botQuery.isPending) return <PageSkeleton />;
@@ -271,6 +287,47 @@ export function BotDetailPage() {
     if (ok) pauseMutation.mutate();
   }
 
+  async function handleClose() {
+    const openOrderCount = gridStateQuery.data?.openOrders.length ?? 0;
+    const hasPosition = Math.abs(positionSize) > 1e-6;
+    const ok = await confirm({
+      variant: 'destructive',
+      title: `Close bot ${botId}?`,
+      description: `${bot.pair} · ${bot.direction.toUpperCase()} · ${bot.leverage}x`,
+      body: (
+        <div className="space-y-2">
+          <p className="font-semibold text-text-primary">
+            This is final. The bot will be marked{' '}
+            <Mono className="text-danger">stopped</Mono> and removed from the
+            active list.
+          </p>
+          <p>The engine will:</p>
+          <ul className="list-disc list-inside space-y-0.5 text-2xs">
+            <li>
+              Cancel <Mono>{openOrderCount || 'ALL'}</Mono> open orders on GRVT
+            </li>
+            {hasPosition ? (
+              <li>
+                Market-close <Mono>{formatSize(Math.abs(positionSize))}</Mono>{' '}
+                ETH at ~0.5% aggressive limit (GTC) — small slippage cost
+              </li>
+            ) : (
+              <li>No position to close (size = 0)</li>
+            )}
+            <li>Flip status to stopped (history is preserved)</li>
+          </ul>
+          <p className="text-2xs text-text-muted">
+            Use <strong className="text-text-primary">Pause</strong> instead if
+            you want to keep the position open and resume later.
+          </p>
+        </div>
+      ),
+      confirmLabel: hasPosition ? 'Cancel orders + close position' : 'Cancel all orders',
+      cancelLabel: 'Keep bot',
+    });
+    if (ok) closeMutation.mutate();
+  }
+
   return (
     <div className="flex flex-col gap-6">
       {/* Page header */}
@@ -285,6 +342,14 @@ export function BotDetailPage() {
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => setRangeDialogOpen(true)}
+            title="Move/expand the grid range — useful when price drifts out of grid"
+          >
+            <SlidersHorizontal className="size-4" />
+            Update range
+          </Button>
           {status === 'running' ? (
             <Button
               variant="secondary"
@@ -294,7 +359,7 @@ export function BotDetailPage() {
               <Pause className="size-4" />
               {pauseMutation.isPending ? 'Pausing…' : 'Pause'}
             </Button>
-          ) : (
+          ) : status === 'paused' ? (
             <Button
               variant="primary"
               onClick={handleStart}
@@ -302,6 +367,17 @@ export function BotDetailPage() {
             >
               <Play className="size-4" />
               {startMutation.isPending ? 'Starting…' : 'Start'}
+            </Button>
+          ) : null}
+          {status !== 'stopped' && (
+            <Button
+              variant="danger"
+              onClick={handleClose}
+              disabled={closeMutation.isPending}
+              title="Cancel all orders and close the position — final stop"
+            >
+              <XCircle className="size-4" />
+              {closeMutation.isPending ? 'Closing…' : 'Close bot'}
             </Button>
           )}
         </div>
@@ -413,6 +489,16 @@ export function BotDetailPage() {
 
       {/* Tabs */}
       <BotDetailTabs botId={botId} />
+
+      {/* Update grid range — operator escape hatch when price drifts
+          out of the current range. Mounted at the page root so it can
+          live-update from the same gridStateQuery the chart uses. */}
+      <UpdateRangeDialog
+        open={rangeDialogOpen}
+        onClose={() => setRangeDialogOpen(false)}
+        bot={bot}
+        markPrice={markPrice}
+      />
     </div>
   );
 }

@@ -51,6 +51,7 @@ interface EngineOps {
   }): Promise<number>;
   startBot(botId: number): Promise<void>;
   pauseBot(botId: number): Promise<void>;
+  closeBot(botId: number): Promise<void>;
   updateBotRange(botId: number, lowerPrice: number, upperPrice: number): Promise<void>;
   previewBotRangeUpdate(botId: number, lowerPrice: number, upperPrice: number): Promise<unknown>;
 }

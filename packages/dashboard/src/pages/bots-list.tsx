@@ -71,7 +71,9 @@ export function BotsListPage() {
     );
   }
 
-  const bots = botsQuery.data?.bots ?? [];
+  // Hide stopped bots from the active list — they live in History.
+  const allBots = botsQuery.data?.bots ?? [];
+  const bots = allBots.filter((b) => b.status !== 'stopped');
   const runningCount = bots.filter((b) => {
     const status = ticks[b.id]?.status ?? b.status;
     return status === 'running';

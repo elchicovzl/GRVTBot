@@ -156,6 +156,16 @@ export const api = {
       method: 'POST',
     }),
 
+  // Final stop. Cancels every open order AND market-closes the open
+  // position with a 0.5% aggressive GTC limit. Bot status flips to
+  // 'stopped' — it stays in the DB for history but no longer counts
+  // as an active bot. Differs from pauseBot which only cancels orders
+  // and leaves the position open for later resume.
+  closeBot: (id: number) =>
+    request<{ id: number; status: 'stopped' }>(`/bots/${id}/close`, {
+      method: 'POST',
+    }),
+
   // Read-only dry-run of a range update. Returns the full plan
   // (orders to cancel, levels to create, ETH to auto-buy with cost
   // estimate, warnings, safety violations) WITHOUT executing anything.

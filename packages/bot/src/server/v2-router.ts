@@ -51,6 +51,7 @@ interface EngineOps {
   }): Promise<number>;
   startBot(botId: number): Promise<void>;
   pauseBot(botId: number): Promise<void>;
+  closeBot(botId: number): Promise<void>;
   updateBotRange(botId: number, lowerPrice: number, upperPrice: number): Promise<void>;
   previewBotRangeUpdate(
     botId: number,
@@ -1014,6 +1015,33 @@ export function createV2Router(deps: V2RouterDeps): Router {
       log.error({ botId: id, err: (err as Error).message }, 'bot pause failed');
       res.status(500).json({
         error: 'pause_failed',
+        message: (err as Error).message,
+      });
+    }
+    return;
+  }));
+
+  // ── POST /api/v2/bots/:id/close ───────────────────────────────────
+  // FULL stop. Cancels every open order on GRVT, then market-closes the
+  // remaining position with a 0.5% aggressive GTC limit (so it crosses
+  // the book and fills immediately). Bot status flips to 'stopped' —
+  // it stays in the DB for history but no longer counts as an active
+  // bot in the overview. Use this when you're done with a bot.
+  //
+  // Differs from /pause: pause only cancels orders and leaves the
+  // position open so you can later /start and resume. /close is final.
+  router.post('/bots/:id/close', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    try {
+      await engineOps.closeBot(id);
+      log.info({ botId: id }, 'bot closed via API');
+      cache.invalidatePrefix('bots');
+      res.json({ id, status: 'stopped' });
+    } catch (err) {
+      log.error({ botId: id, err: (err as Error).message }, 'bot close failed');
+      res.status(500).json({
+        error: 'close_failed',
         message: (err as Error).message,
       });
     }

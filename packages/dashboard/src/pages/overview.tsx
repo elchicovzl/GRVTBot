@@ -81,7 +81,11 @@ export function OverviewPage() {
     );
   }
 
-  const bots = botsQuery.data?.bots ?? [];
+  // Hide stopped bots from the active overview. They stay in the DB
+  // for history (queryable via /history later) but don't pollute the
+  // count, the aggregate stats, or the bot card grid.
+  const allBots = botsQuery.data?.bots ?? [];
+  const bots = allBots.filter((b) => b.status !== 'stopped');
 
   // Aggregate equity / pnl across all bots, preferring tick data when present.
   // Aggregate, source-of-truth-aware:
