@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { History, Hexagon, LayoutGrid, Settings } from 'lucide-react';
+import { Hexagon, LayoutGrid, Settings } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { LucideIcon } from 'lucide-react';
 
@@ -10,10 +10,12 @@ interface NavItem {
   end?: boolean;
 }
 
+// History tab removed: there is no cross-bot activity view yet — bot detail
+// already exposes the per-bot Fills/Snapshots tables. Will reintroduce when
+// there's a real global timeline to show.
 const NAV: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutGrid, end: true },
   { to: '/bots', label: 'Bots', icon: Hexagon },
-  { to: '/history', label: 'History', icon: History },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -51,7 +53,7 @@ export function Sidebar() {
       </nav>
       <div className="px-3 pt-3 mt-2 border-t border-border-subtle">
         <span className="text-2xs uppercase tracking-wider text-text-disabled">
-          v0.1.0 · B.3
+          v0.1.0 · B.5
         </span>
       </div>
     </aside>

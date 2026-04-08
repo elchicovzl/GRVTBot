@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { History, Hexagon, LayoutGrid, Settings } from 'lucide-react';
+import { Hexagon, LayoutGrid, Settings } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { LucideIcon } from 'lucide-react';
 
@@ -13,7 +13,6 @@ interface NavItem {
 const NAV: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutGrid, end: true },
   { to: '/bots', label: 'Bots', icon: Hexagon },
-  { to: '/history', label: 'History', icon: History },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 

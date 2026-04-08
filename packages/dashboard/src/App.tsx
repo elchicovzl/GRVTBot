@@ -65,7 +65,6 @@ export default function App() {
                 </ErrorBoundary>
               }
             />
-            <Route path="history" element={<Navigate to="/" replace />} />
             <Route
               path="settings"
               element={
