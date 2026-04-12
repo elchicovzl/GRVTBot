@@ -1,0 +1,93 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "title": "GRVT Grid Bot",
+  "uid": "grvt-grid-bot",
+  "version": 1,
+  "panels": [
+    {
+      "title": "Bot Status",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "grvt_bot_count{status=\"running\"}", "legendFormat": "Running" }
+      ]
+    },
+    {
+      "title": "Equity (USDT)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "grvt_bot_equity_usdt", "legendFormat": "Bot {{bot_id}} {{pair}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 2 }
+      }
+    },
+    {
+      "title": "Realized Profit",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "grvt_bot_realized_usdt", "legendFormat": "Bot {{bot_id}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 2 }
+      }
+    },
+    {
+      "title": "Unrealized PnL",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "grvt_bot_unrealized_usdt", "legendFormat": "Bot {{bot_id}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 2 }
+      }
+    },
+    {
+      "title": "Position Size",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "grvt_bot_position_size", "legendFormat": "Bot {{bot_id}} {{pair}}" }
+      ]
+    },
+    {
+      "title": "Fill Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "rate(grvt_fills_total[5m]) * 60", "legendFormat": "fills/min" }
+      ]
+    },
+    {
+      "title": "Memory Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "grvt_process_memory_rss_bytes / 1024 / 1024", "legendFormat": "RSS (MB)" },
+        { "expr": "grvt_process_memory_heap_bytes / 1024 / 1024", "legendFormat": "Heap (MB)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "decmbytes" } }
+    },
+    {
+      "title": "Uptime",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "grvt_process_uptime_seconds / 3600", "legendFormat": "hours" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "h", "decimals": 1 } }
+    }
+  ],
+  "time": { "from": "now-24h", "to": "now" },
+  "refresh": "30s"
+}
