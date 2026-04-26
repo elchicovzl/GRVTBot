@@ -31,6 +31,7 @@ All 6/6 deployed: Prometheus metrics, Grafana template, automated backups, rollb
 
 ### Phase H — Advanced Trading ✅
 - **H.2 — Dynamic grid (auto-shift)**: opt-in per bot. When mark price exits the range by >= `auto_shift_pct` of range width, monitor sets `autoShiftRequested`; the engine handler re-centers the range on current price (same width) by reusing `updateBotRange()`. Rate-limited to once per hour via persisted `last_auto_shift_at`. Emits `autoShifted` event → WS notification. Dashboard shows status card on bot detail when enabled.
+- **H.3 — Stop-loss / take-profit**: opt-in per bot via `sl_pct`/`tp_pct` (% of `investment_usdt`). Engine throws `SAFEGUARD:pause_close` when crossed; `monitorAllBots` catches and routes to `closeBot`. Dashboard exposes editable card on bot detail (PATCH `/bots/:id/risk`) — clearing the field disables the guard. Critical bug fix shipped: previous `updatePnL` catch silently swallowed the SAFEGUARD throw, so SL/TP never fired.
 - **H.8 — Virtual Grids**: user can configure up to 500 grid levels; engine maintains an "active window" of N closest-to-price levels (default 70, max 80 = GRVT cap minus margin) with the rest as `state='virtual'`. Window rotates as price moves: closer levels activate, farther ones get cancelled and demoted. Initial purchase counts ALL sell levels (incl virtuals) so backing is correct from day one. Schema: `grid_bots.virtual_enabled`, `grid_bots.active_window_size`, `grid_levels.state`.
 - Dashboard: virtual levels render as dotted muted lines on the chart, stats strip shows `N active · M virtual · K filled`, "VIRTUAL" entry in chart legend.
 
@@ -62,7 +63,6 @@ All 6/6 deployed: Prometheus metrics, Grafana template, automated backups, rollb
 ### Phase H (next-gen, all new)
 | # | Task | Why | Est |
 |---|------|-----|-----|
-| H.3 | **Stop-loss / take-profit** — auto-close bot at configurable threshold | No automated exit strategy | 3h |
 | H.5 | **Multi-sub-account** — connect multiple GRVT sub-accounts, run bots on each | Power-user isolation between strategies | 3h |
 | H.6 | **Backtesting** — simulate grid on historical candles | Test parameters before risking capital | 8h |
 | H.7 | **Portfolio view** — aggregate equity / PnL / risk across all bots | Overview lacks aggregate stats | 3h |
@@ -75,11 +75,10 @@ Plan exists at `~/.claude/plans/effervescent-sparking-lamport.md`. Deferred unti
 ## Priority order (recommended next)
 
 ```
-1. H.3 — Stop-loss / take-profit (~3h, risk management)
-2. H.5 — Multi-sub-account       (~3h, schema ready)
-3. H.7 — Portfolio view          (~3h, lifts overview UX)
-4. D remainders                  (~10h, test coverage)
-5. H.6 — Backtesting             (~8h, big feature)
+1. H.5 — Multi-sub-account       (~3h, schema ready)
+2. H.7 — Portfolio view          (~3h, lifts overview UX)
+3. D remainders                  (~10h, test coverage)
+4. H.6 — Backtesting             (~8h, big feature)
 ```
 
 Phase I (Lumina) waits for protocol maturity. No work scheduled.

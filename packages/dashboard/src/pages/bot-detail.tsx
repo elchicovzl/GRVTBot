@@ -569,6 +569,13 @@ export function BotDetailPage() {
         <CompoundSettings bot={bot} />
       )}
 
+      {/* H.3 — Stop-loss / take-profit. Editable in-place — clearing the
+          field disables it. Hidden for stopped bots since the engine is
+          no longer monitoring. */}
+      {status !== 'stopped' && (
+        <RiskSettings bot={bot} />
+      )}
+
       {/* H.2 — auto-shift status. Only shown when the bot was configured
           with auto_shift_enabled at creation. Read-only view. */}
       {bot.auto_shift_enabled === 1 && (
@@ -588,6 +595,108 @@ export function BotDetailPage() {
         markPrice={markPrice}
       />
     </div>
+  );
+}
+
+// ── H.3: Stop-loss / Take-profit settings (editable in place).
+// Both are percentages of investment_usdt. Empty input disables the
+// guard. The engine refreshes the bot row at the top of every monitor
+// tick so changes take effect within ~5s.
+
+function RiskSettings({ bot }: { bot: any }) {
+  const qc = useQueryClient();
+  const [sl, setSl] = useState<string>(
+    bot.sl_pct != null ? String(bot.sl_pct) : ''
+  );
+  const [tp, setTp] = useState<string>(
+    bot.tp_pct != null ? String(bot.tp_pct) : ''
+  );
+
+  const slNum = sl === '' ? null : parseFloat(sl);
+  const tpNum = tp === '' ? null : parseFloat(tp);
+
+  const slInvalid =
+    sl !== '' && (Number.isNaN(slNum!) || slNum! <= 0 || slNum! > 100);
+  const tpInvalid =
+    tp !== '' && (Number.isNaN(tpNum!) || tpNum! <= 0 || tpNum! > 1000);
+
+  const dirty =
+    (bot.sl_pct ?? null) !== slNum || (bot.tp_pct ?? null) !== tpNum;
+
+  const mut = useMutation({
+    mutationFn: () => api.updateRisk(bot.id, { sl_pct: slNum, tp_pct: tpNum }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['bots'] });
+      qc.invalidateQueries({ queryKey: ['bot', bot.id] });
+      toast.success(
+        slNum == null && tpNum == null
+          ? 'Stop-loss and take-profit disabled'
+          : 'Risk settings updated'
+      );
+    },
+    onError: (err) => toast.error((err as Error).message),
+  });
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h3 className="text-sm font-semibold text-text-primary">
+            Stop-loss / Take-profit
+          </h3>
+          <p className="text-2xs text-text-muted mt-0.5">
+            Auto-close the bot when total PnL crosses these % thresholds
+            (relative to invested capital). Empty disables.
+          </p>
+        </div>
+        <Button
+          variant="primary"
+          disabled={!dirty || slInvalid || tpInvalid || mut.isPending}
+          onClick={() => mut.mutate()}
+        >
+          {mut.isPending ? 'Saving...' : 'Save'}
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="text-2xs text-text-muted block mb-1">
+            Stop-loss (% of invested, max 100)
+          </label>
+          <input
+            type="number"
+            inputMode="decimal"
+            min="0"
+            max="100"
+            step="0.1"
+            placeholder="off"
+            value={sl}
+            onChange={(e) => setSl(e.target.value)}
+            className={`w-full bg-bg-base border rounded-md px-3 py-2 text-sm font-mono text-text-primary outline-none focus:ring-2 focus:ring-primary/50 ${
+              slInvalid ? 'border-danger' : 'border-border-default'
+            }`}
+          />
+        </div>
+        <div>
+          <label className="text-2xs text-text-muted block mb-1">
+            Take-profit (% of invested, max 1000)
+          </label>
+          <input
+            type="number"
+            inputMode="decimal"
+            min="0"
+            max="1000"
+            step="0.1"
+            placeholder="off"
+            value={tp}
+            onChange={(e) => setTp(e.target.value)}
+            className={`w-full bg-bg-base border rounded-md px-3 py-2 text-sm font-mono text-text-primary outline-none focus:ring-2 focus:ring-primary/50 ${
+              tpInvalid ? 'border-danger' : 'border-border-default'
+            }`}
+          />
+        </div>
+      </div>
+    </Card>
   );
 }
 

@@ -1727,6 +1727,56 @@ export function createV2Router(deps: V2RouterDeps): Router {
     return;
   }));
 
+  // ── PATCH /api/v2/bots/:id/risk ───────────────────────────────────
+  // H.3: edit-in-place SL/TP. The fields are nullable on purpose — a
+  // user may have set sl_pct=10 at create time and want to remove it
+  // later without recreating the bot. The engine refreshes the bot row
+  // at the top of every monitor tick so changes take effect within ~5s.
+  router.patch('/bots/:id/risk', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
+
+    const body = (req.body ?? {}) as { sl_pct?: number | null; tp_pct?: number | null };
+    const updates: Record<string, number | null> = {};
+
+    if ('sl_pct' in body) {
+      const v = body.sl_pct;
+      if (v == null || v === 0) {
+        updates.sl_pct = null;
+      } else if (typeof v !== 'number' || v <= 0 || v > 100) {
+        return res.status(400).json({ error: 'sl_pct must be 0/null (disable) or between 0 and 100' });
+      } else {
+        updates.sl_pct = v;
+      }
+    }
+    if ('tp_pct' in body) {
+      const v = body.tp_pct;
+      if (v == null || v === 0) {
+        updates.tp_pct = null;
+      } else if (typeof v !== 'number' || v <= 0 || v > 1000) {
+        return res.status(400).json({ error: 'tp_pct must be 0/null (disable) or between 0 and 1000' });
+      } else {
+        updates.tp_pct = v;
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'no fields to update' });
+    }
+
+    await dbRun(db, `
+      UPDATE grid_bots
+      SET ${Object.keys(updates).map(k => `${k} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [...Object.values(updates), id]);
+
+    cache.invalidatePrefix('bots');
+    log.info({ botId: id, ...updates }, 'risk settings updated');
+    res.json({ id, ...updates });
+    return;
+  }));
+
   // ── POST /api/v2/bots/:id/range/preview ───────────────────────────
   // Read-only dry-run of a range update. Returns the full RangeUpdatePlan
   // (orders to cancel, levels to create, ETH to auto-buy, slippage cost,

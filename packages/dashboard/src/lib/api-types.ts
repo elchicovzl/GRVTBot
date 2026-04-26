@@ -34,6 +34,9 @@ export interface BotSummary {
   auto_shift_enabled?: 0 | 1;
   auto_shift_pct?: number | null;
   last_auto_shift_at?: number | null;
+  // H.3: stop-loss / take-profit (% of investment_usdt)
+  sl_pct?: number | null;
+  tp_pct?: number | null;
   // H.8: virtual grids
   virtual_enabled?: 0 | 1;
   active_window_size?: number | null;

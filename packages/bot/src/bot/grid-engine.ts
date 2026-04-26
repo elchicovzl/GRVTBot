@@ -3293,6 +3293,14 @@ export class GridBotInstance {
       }
 
     } catch (error) {
+      // H.3: SL/TP throw a SAFEGUARD: error that monitorAllBots() must
+      // see to actually pause+close the bot. Swallowing it here (the
+      // historical default for cosmetic GRVT errors during PnL refresh)
+      // would silently disable stop-loss. Rethrow safeguards; eat the
+      // rest as before.
+      if (error instanceof Error && error.message.includes('SAFEGUARD')) {
+        throw error;
+      }
       log.error({ err: (error as Error).message }, `❌ Error actualizando PnL bot ${this.bot.id}:`);
     }
   }

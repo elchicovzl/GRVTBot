@@ -237,6 +237,18 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  updateRisk: (
+    id: number,
+    body: { sl_pct?: number | null; tp_pct?: number | null }
+  ) =>
+    request<{ id: number; sl_pct?: number | null; tp_pct?: number | null }>(
+      `/bots/${id}/risk`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      }
+    ),
+
   updateCompound: (
     id: number,
     body: {
