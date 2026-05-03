@@ -94,7 +94,7 @@ export interface RangeUpdatePlan {
  * Extracted as a standalone function so both createBot/validate and
  * checkCompoundRebalance use the exact same formula.
  */
-function computeQtyPerLevel(
+export function computeQtyPerLevel(
   investmentUsdt: number,
   leverage: number,
   numGrids: number,
@@ -114,6 +114,212 @@ function computeQtyPerLevel(
     qty += minSize;
   }
   return Math.round(qty * 100) / 100;
+}
+
+/**
+ * Pure compound rebalance decision. Returns whether the bot should
+ * compound right now and, if so, the amounts to apply. Extracted from
+ * checkCompoundRebalance() so the rules can be tested in isolation
+ * without spinning up the engine.
+ *
+ * `alreadyCompounded` comes from the cash_movements table — the sum of
+ * prior compound rebalances. We subtract it from grid_profit_usdt so
+ * each compound only acts on NEW profit since the last one.
+ */
+export type CompoundDecision =
+  | { compound: false; reason: 'disabled'; }
+  | { compound: false; reason: 'interval_lock'; hoursSince: number; intervalHours: number; }
+  | { compound: false; reason: 'below_threshold'; availableProfit: number; threshold: number; }
+  | {
+      compound: true;
+      compoundAmount: number;
+      newInvestment: number;
+      newQty: number;
+      availableProfit: number;
+      gridProfit: number;
+    };
+
+/**
+ * Pure computation of a range update plan. Same algorithm as
+ * buildRangeUpdatePlan() but with all IO hoisted out so the safety /
+ * level-recompute logic can be tested in isolation. The orchestrator
+ * (buildRangeUpdatePlan) fetches the bot, ticker, position, and
+ * existing levels, then delegates here.
+ *
+ * `positionReadError` is the message from a failed client.getPosition()
+ * call — when set, we record a safety violation and treat the position
+ * as 0 (which usually triggers a deficit warning, depending on grid).
+ */
+export interface RangeUpdateInputs {
+  bot: Pick<
+    GridBot,
+    'id' | 'pair' | 'lower_price' | 'upper_price' | 'num_grids' | 'quantity_per_level'
+  >;
+  newLower: number;
+  newUpper: number;
+  currentPrice: number;
+  currentPosition: number;
+  existingLevels: Array<Pick<GridLevel, 'order_id' | 'price'>>;
+  positionReadError?: string;
+}
+
+const MAX_AUTO_BUY_ETH = 2.0;
+const MIN_LOWER_DISTANCE_PCT = 0.5;
+const MAX_UPPER_DISTANCE_PCT = 2.0;
+const AUTO_BUY_SLIPPAGE_PCT = 0.5;
+
+export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePlan {
+  const { bot, newLower, newUpper, currentPrice, currentPosition, existingLevels, positionReadError } = input;
+
+  const noop =
+    Math.abs(newLower - bot.lower_price) < 0.01 &&
+    Math.abs(newUpper - bot.upper_price) < 0.01;
+
+  const safetyViolations: string[] = [];
+
+  if (newLower <= 0 || newUpper <= 0 || newLower >= newUpper) {
+    safetyViolations.push('Invalid range: lower must be < upper, both > 0');
+  }
+  if (currentPrice < newLower || currentPrice > newUpper) {
+    safetyViolations.push(
+      `Current price $${currentPrice.toFixed(2)} is outside new range $${newLower}-$${newUpper}`
+    );
+  }
+  if (newLower < currentPrice * MIN_LOWER_DISTANCE_PCT) {
+    safetyViolations.push(
+      `Lower price too far below market: $${newLower} < ${(MIN_LOWER_DISTANCE_PCT * 100).toFixed(0)}% of $${currentPrice.toFixed(2)}`
+    );
+  }
+  if (newUpper > currentPrice * MAX_UPPER_DISTANCE_PCT) {
+    safetyViolations.push(
+      `Upper price too far above market: $${newUpper} > ${(MAX_UPPER_DISTANCE_PCT * 100).toFixed(0)}% of $${currentPrice.toFixed(2)}`
+    );
+  }
+  if (positionReadError) {
+    safetyViolations.push(`Cannot read live position from GRVT: ${positionReadError}`);
+  }
+
+  const canonicalQty = bot.quantity_per_level ?? 0;
+  if (!canonicalQty || canonicalQty <= 0) {
+    safetyViolations.push('Bot has no quantity_per_level set (legacy bot, run migration)');
+  }
+
+  const numGrids = bot.num_grids;
+  const newSpacing = (newUpper - newLower) / numGrids;
+
+  const newLevels: Array<{ level_index: number; price: number; side: 'buy' | 'sell'; quantity: number }> = [];
+  let sellLevelsCount = 0;
+  for (let i = 0; i <= numGrids; i++) {
+    const price = Math.round((newLower + i * newSpacing) * 100) / 100;
+    const side: 'buy' | 'sell' = price < currentPrice ? 'buy' : 'sell';
+    newLevels.push({ level_index: i, price, side, quantity: canonicalQty });
+    if (side === 'sell') sellLevelsCount++;
+  }
+
+  const ethNeeded = sellLevelsCount * canonicalQty;
+  const ethDeficit = Math.max(0, ethNeeded - currentPosition);
+  const ethExcess = Math.max(0, currentPosition - ethNeeded);
+
+  if (ethDeficit > MAX_AUTO_BUY_ETH) {
+    safetyViolations.push(
+      `Auto-buy deficit ${ethDeficit.toFixed(4)} ETH exceeds safety cap of ${MAX_AUTO_BUY_ETH} ETH`
+    );
+  }
+
+  const autoBuyAggressivePrice =
+    Math.ceil(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100) * 100) / 100;
+  const autoBuyEstimatedCost = ethDeficit * autoBuyAggressivePrice;
+  const autoBuySlippageCostUsd = ethDeficit * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
+
+  const ordersToCancel = existingLevels
+    .filter((l) =>
+      l.order_id && l.order_id !== '0x00' && l.order_id !== 'price_based_detection'
+    )
+    .map((l) => ({ order_id: l.order_id!, price: l.price }));
+
+  const warnings: string[] = [];
+  if (noop) warnings.push('Range unchanged — this is a no-op');
+  if (ethDeficit > 0) {
+    warnings.push(
+      `Will market-buy ${ethDeficit.toFixed(4)} ETH at ~$${autoBuyAggressivePrice} (~$${autoBuyEstimatedCost.toFixed(2)} total, ~$${autoBuySlippageCostUsd.toFixed(2)} slippage)`
+    );
+  }
+  if (ethExcess > 0) {
+    warnings.push(
+      `Position has ${ethExcess.toFixed(4)} ETH excess vs the new sell-side requirement; the grid will absorb it naturally as sells fill`
+    );
+  }
+
+  return {
+    botId: bot.id,
+    currentRange: { lower: bot.lower_price, upper: bot.upper_price },
+    newRange: { lower: newLower, upper: newUpper },
+    currentPrice,
+    currentPosition,
+    newSellLevels: sellLevelsCount,
+    newBuyLevels: newLevels.length - sellLevelsCount,
+    newTotalLevels: newLevels.length,
+    newSpacing,
+    canonicalQty,
+    ethNeeded,
+    ethDeficit,
+    ethExcess,
+    autoBuy:
+      ethDeficit > 0
+        ? {
+            size: ethDeficit,
+            estimatedPrice: autoBuyAggressivePrice,
+            estimatedCost: autoBuyEstimatedCost,
+            slippagePct: AUTO_BUY_SLIPPAGE_PCT,
+            estimatedSlippageUsd: autoBuySlippageCostUsd,
+          }
+        : null,
+    ordersToCancel: ordersToCancel.length,
+    ordersToCancelSample: ordersToCancel.slice(0, 5),
+    levelsToCreate: newLevels.length,
+    newLevels,
+    warnings,
+    safetyViolations,
+    noop,
+  };
+}
+
+export function decideCompound(
+  bot: Pick<
+    GridBot,
+    | 'pair' | 'investment_usdt' | 'leverage' | 'num_grids'
+    | 'lower_price' | 'upper_price' | 'grid_profit_usdt'
+    | 'compound_pct' | 'compound_threshold_usdt'
+    | 'compound_interval_hours' | 'last_compound_at'
+  >,
+  alreadyCompounded: number,
+  now: Date = new Date()
+): CompoundDecision {
+  const pct = bot.compound_pct ?? 0;
+  const threshold = bot.compound_threshold_usdt ?? 50;
+  const intervalHours = bot.compound_interval_hours ?? 24;
+
+  if (pct <= 0) return { compound: false, reason: 'disabled' };
+
+  if (bot.last_compound_at) {
+    const hoursSince = (now.getTime() - new Date(bot.last_compound_at).getTime()) / (1000 * 60 * 60);
+    if (hoursSince < intervalHours) {
+      return { compound: false, reason: 'interval_lock', hoursSince, intervalHours };
+    }
+  }
+
+  const gridProfit = bot.grid_profit_usdt ?? 0;
+  const availableProfit = gridProfit - alreadyCompounded;
+  if (availableProfit < threshold) {
+    return { compound: false, reason: 'below_threshold', availableProfit, threshold };
+  }
+
+  const compoundAmount = availableProfit * (pct / 100);
+  const newInvestment = bot.investment_usdt + compoundAmount;
+  const midPrice = (bot.lower_price + bot.upper_price) / 2;
+  const newQty = computeQtyPerLevel(newInvestment, bot.leverage, bot.num_grids, midPrice, bot.pair);
+
+  return { compound: true, compoundAmount, newInvestment, newQty, availableProfit, gridProfit };
 }
 
 // GRVT maintenance margin used by calculateLiquidationPrice() in the
@@ -1412,63 +1618,43 @@ export class GridEngine extends EventEmitter {
   private async checkCompoundRebalance(): Promise<void> {
     try {
       const bots = await db.getAllBots();
+      const now = new Date();
 
       for (const bot of bots) {
         if (bot.status !== 'running') continue;
 
-        const pct = bot.compound_pct || 0;
-        const threshold = bot.compound_threshold_usdt || 50;
-        const intervalHours = bot.compound_interval_hours || 24;
-        const lastCompoundAt = bot.last_compound_at;
-
-        if (pct <= 0) continue; // Compound disabled for this bot
-
-        // Check if enough time has passed since last compound
-        if (lastCompoundAt) {
-          const hoursSince = (Date.now() - new Date(lastCompoundAt).getTime()) / (1000 * 60 * 60);
-          if (hoursSince < intervalHours) continue;
-        }
-
-        // Use real grid profit from spread-paired fills, NOT balance diff.
-        // Subtract cumulative compound amount already taken.
-        const gridProfitTotal = bot.grid_profit_usdt ?? 0;
-        const alreadyCompounded = await db.getCompoundedTotal(bot.id) ?? 0;
-        const availableProfit = gridProfitTotal - alreadyCompounded;
-
-        if (availableProfit < threshold) {
-          log.info(`📊 Compound bot ${bot.id}: $${availableProfit.toFixed(2)} available < $${threshold} threshold — skip`);
+        const alreadyCompounded = (await db.getCompoundedTotal(bot.id)) ?? 0;
+        const decision = decideCompound(bot, alreadyCompounded, now);
+        if (!decision.compound) {
+          if (decision.reason === 'below_threshold') {
+            log.info(`📊 Compound bot ${bot.id}: $${decision.availableProfit.toFixed(2)} available < $${decision.threshold} threshold — skip`);
+          }
           continue;
         }
 
-        // Calculate compound amount and new qty_per_level.
-        const compoundAmount = availableProfit * (pct / 100);
-        const newInvestment = bot.investment_usdt + compoundAmount;
-        const midPrice = (bot.lower_price + bot.upper_price) / 2;
-        const newQty = computeQtyPerLevel(newInvestment, bot.leverage, bot.num_grids, midPrice, bot.pair);
         const oldQty = bot.quantity_per_level || 0;
-
-        log.info(`🔄 Compound bot ${bot.id}: +$${compoundAmount.toFixed(2)} (${pct}% of $${availableProfit.toFixed(2)} profit)`);
-        log.info(`   investment: $${bot.investment_usdt.toFixed(2)} → $${newInvestment.toFixed(2)}, qty: ${oldQty} → ${newQty}`);
+        log.info(`🔄 Compound bot ${bot.id}: +$${decision.compoundAmount.toFixed(2)} (${bot.compound_pct}% of $${decision.availableProfit.toFixed(2)} profit)`);
+        log.info(`   investment: $${bot.investment_usdt.toFixed(2)} → $${decision.newInvestment.toFixed(2)}, qty: ${oldQty} → ${decision.newQty}`);
 
         // Atomic DB update: bump investment AND qty_per_level together.
         // New orders placed by monitor() will use the new qty. Existing
         // orders stay at old qty until they fill and get replaced — the
         // position adjusts organically over grid cycles.
         await db.updateBot(bot.id, {
-          investment_usdt: newInvestment,
-          quantity_per_level: newQty,
-          total_reinvested: (bot.total_reinvested || 0) + compoundAmount,
-          last_compound_at: new Date().toISOString(),
+          investment_usdt: decision.newInvestment,
+          quantity_per_level: decision.newQty,
+          total_reinvested: (bot.total_reinvested || 0) + decision.compoundAmount,
+          last_compound_at: now.toISOString(),
         });
 
         await db.recordCashMovement({
           bot_id: bot.id,
           type: 'compound',
-          amount_usdt: compoundAmount,
-          notes: `${pct}% of $${availableProfit.toFixed(2)} grid profit (lifetime $${gridProfitTotal.toFixed(2)}, qty ${oldQty}→${newQty})`,
+          amount_usdt: decision.compoundAmount,
+          notes: `${bot.compound_pct}% of $${decision.availableProfit.toFixed(2)} grid profit (lifetime $${decision.gridProfit.toFixed(2)}, qty ${oldQty}→${decision.newQty})`,
         });
 
-        log.info(`✅ Bot ${bot.id} compounded: $${bot.investment_usdt.toFixed(2)} → $${newInvestment.toFixed(2)}`);
+        log.info(`✅ Bot ${bot.id} compounded: $${bot.investment_usdt.toFixed(2)} → $${decision.newInvestment.toFixed(2)}`);
       }
 
     } catch (error) {
@@ -1575,151 +1761,26 @@ export class GridEngine extends EventEmitter {
       throw new Error(`Bot ${botId}: invalid ticker price`);
     }
 
-    // No-op detection (1 cent tolerance on each bound).
-    const noop =
-      Math.abs(newLower - bot.lower_price) < 0.01 &&
-      Math.abs(newUpper - bot.upper_price) < 0.01;
-
-    // ── SAFETY CAPS (hard, non-overrideable) ─────────────────────
-    const MAX_AUTO_BUY_ETH = 2.0;
-    const MIN_LOWER_DISTANCE_PCT = 0.5;  // newLower ≥ 0.5 × current
-    const MAX_UPPER_DISTANCE_PCT = 2.0;  // newUpper ≤ 2.0 × current
-    const AUTO_BUY_SLIPPAGE_PCT = 0.5;
-
-    const safetyViolations: string[] = [];
-
-    if (newLower <= 0 || newUpper <= 0 || newLower >= newUpper) {
-      safetyViolations.push('Invalid range: lower must be < upper, both > 0');
-    }
-    if (currentPrice < newLower || currentPrice > newUpper) {
-      safetyViolations.push(
-        `Current price $${currentPrice.toFixed(2)} is outside new range $${newLower}-$${newUpper}`
-      );
-    }
-    if (newLower < currentPrice * MIN_LOWER_DISTANCE_PCT) {
-      safetyViolations.push(
-        `Lower price too far below market: $${newLower} < ${(MIN_LOWER_DISTANCE_PCT * 100).toFixed(0)}% of $${currentPrice.toFixed(2)}`
-      );
-    }
-    if (newUpper > currentPrice * MAX_UPPER_DISTANCE_PCT) {
-      safetyViolations.push(
-        `Upper price too far above market: $${newUpper} > ${(MAX_UPPER_DISTANCE_PCT * 100).toFixed(0)}% of $${currentPrice.toFixed(2)}`
-      );
-    }
-
-    // ── CANONICAL QTY (immutable, single source of truth) ────────
-    const canonicalQty = (bot as { quantity_per_level?: number }).quantity_per_level
-      ?? 0; // 0 = unknown, will be flagged in violations
-    if (!canonicalQty || canonicalQty <= 0) {
-      safetyViolations.push('Bot has no quantity_per_level set (legacy bot, run migration)');
-    }
-
-    // ── PLAN COMPUTATION ──────────────────────────────────────────
-    const numGrids = bot.num_grids;
-    const newSpacing = (newUpper - newLower) / numGrids;
-
-    // Build the full new level set (level_index 0..numGrids).
-    const newLevels: Array<{
-      level_index: number;
-      price: number;
-      side: 'buy' | 'sell';
-      quantity: number;
-    }> = [];
-    let sellLevelsCount = 0;
-    for (let i = 0; i <= numGrids; i++) {
-      const price = Math.round((newLower + i * newSpacing) * 100) / 100;
-      const side: 'buy' | 'sell' = price < currentPrice ? 'buy' : 'sell';
-      newLevels.push({ level_index: i, price, side, quantity: canonicalQty });
-      if (side === 'sell') sellLevelsCount++;
-    }
-
-    // ETH backing required for the sell side. In long-only perpetual
-    // grids, the position size should equal (number of pending sells)
-    // × (qty per sell). If short on backing, we must market-buy the
-    // deficit BEFORE the sells go in or they'd take us short.
-    const ethNeeded = sellLevelsCount * canonicalQty;
-
-    // Live position from GRVT — resolved via the per-bot client. The
-    // `client` was set earlier in buildRangeUpdatePlan() when we read
-    // the ticker.
     let currentPosition = 0;
+    let positionReadError: string | undefined;
     try {
       const position = await client.getPosition(bot.pair);
       if (position) currentPosition = parseFloat(position.size);
     } catch (posErr) {
-      safetyViolations.push(
-        `Cannot read live position from GRVT: ${(posErr as Error).message}`
-      );
+      positionReadError = (posErr as Error).message;
     }
 
-    const ethDeficit = Math.max(0, ethNeeded - currentPosition);
-    const ethExcess = Math.max(0, currentPosition - ethNeeded);
-
-    if (ethDeficit > MAX_AUTO_BUY_ETH) {
-      safetyViolations.push(
-        `Auto-buy deficit ${ethDeficit.toFixed(4)} ETH exceeds safety cap of ${MAX_AUTO_BUY_ETH} ETH`
-      );
-    }
-
-    const autoBuyAggressivePrice =
-      Math.ceil(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100) * 100) / 100;
-    const autoBuyEstimatedCost = ethDeficit * autoBuyAggressivePrice;
-    const autoBuySlippageCostUsd = ethDeficit * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
-
-    // List existing levels that would be cancelled (any with a real
-    // order_id, since we replaceAllGridLevels and re-place from scratch).
     const existingLevels = await db.getGridLevels(botId);
-    const ordersToCancel = existingLevels
-      .filter((l) =>
-        l.order_id && l.order_id !== '0x00' && l.order_id !== 'price_based_detection'
-      )
-      .map((l) => ({ order_id: l.order_id!, price: l.price }));
 
-    const warnings: string[] = [];
-    if (noop) warnings.push('Range unchanged — this is a no-op');
-    if (ethDeficit > 0) {
-      warnings.push(
-        `Will market-buy ${ethDeficit.toFixed(4)} ETH at ~$${autoBuyAggressivePrice} (~$${autoBuyEstimatedCost.toFixed(2)} total, ~$${autoBuySlippageCostUsd.toFixed(2)} slippage)`
-      );
-    }
-    if (ethExcess > 0) {
-      warnings.push(
-        `Position has ${ethExcess.toFixed(4)} ETH excess vs the new sell-side requirement; the grid will absorb it naturally as sells fill`
-      );
-    }
-
-    return {
-      botId,
-      currentRange: { lower: bot.lower_price, upper: bot.upper_price },
-      newRange: { lower: newLower, upper: newUpper },
+    return computeRangeUpdatePlan({
+      bot,
+      newLower,
+      newUpper,
       currentPrice,
       currentPosition,
-      newSellLevels: sellLevelsCount,
-      newBuyLevels: newLevels.length - sellLevelsCount,
-      newTotalLevels: newLevels.length,
-      newSpacing,
-      canonicalQty,
-      ethNeeded,
-      ethDeficit,
-      ethExcess,
-      autoBuy:
-        ethDeficit > 0
-          ? {
-              size: ethDeficit,
-              estimatedPrice: autoBuyAggressivePrice,
-              estimatedCost: autoBuyEstimatedCost,
-              slippagePct: AUTO_BUY_SLIPPAGE_PCT,
-              estimatedSlippageUsd: autoBuySlippageCostUsd,
-            }
-          : null,
-      ordersToCancel: ordersToCancel.length,
-      ordersToCancelSample: ordersToCancel.slice(0, 5),
-      levelsToCreate: newLevels.length,
-      newLevels,
-      warnings,
-      safetyViolations,
-      noop,
-    };
+      existingLevels,
+      positionReadError,
+    });
   }
 
   /**
