@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { GRVT_MARKET_DATA_BASE_URL, GRVT_TRADING_BASE_URL } from './grvt-config.js';
 
 dotenv.config();
 
@@ -11,7 +12,7 @@ async function testMarketDataDirect() {
   try {
     // Test 1: Obtener instrumentos
     console.log('🎯 Testing /instruments endpoint...');
-    const instrumentsRes = await fetch('https://market-data.grvt.io/full/v1/instruments', {
+    const instrumentsRes = await fetch(`${GRVT_MARKET_DATA_BASE_URL}/instruments`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}'
@@ -43,7 +44,7 @@ async function testMarketDataDirect() {
 
     // Test 2: Ticker de BTC
     console.log('\n💰 Testing BTC ticker...');
-    const btcTickerRes = await fetch('https://market-data.grvt.io/full/v1/ticker', {
+    const btcTickerRes = await fetch(`${GRVT_MARKET_DATA_BASE_URL}/ticker`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ instrument: 'BTC_USDT_Perp' })
@@ -59,7 +60,7 @@ async function testMarketDataDirect() {
 
     // Test 3: Ticker de ETH
     console.log('\n💰 Testing ETH ticker...');
-    const ethTickerRes = await fetch('https://market-data.grvt.io/full/v1/ticker', {
+    const ethTickerRes = await fetch(`${GRVT_MARKET_DATA_BASE_URL}/ticker`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ instrument: 'ETH_USDT_Perp' })
@@ -88,7 +89,7 @@ async function testTradingAuth() {
     
     // Para la Trading API se necesita cookie-based auth
     // Por ahora solo testeo si el endpoint responde
-    const tradingRes = await fetch('https://trades.grvt.io/full/v1/account_summary', {
+    const tradingRes = await fetch(`${GRVT_TRADING_BASE_URL}/account_summary`, {
       method: 'POST', 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

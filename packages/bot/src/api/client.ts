@@ -16,8 +16,10 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // Endpoints GRVT verificados por Marta
-const MARKET_DATA_URL = 'https://market-data.grvt.io/full/v1';
-const TRADING_URL = 'https://trades.grvt.io/full/v1';
+import { GRVT_MARKET_DATA_BASE_URL, GRVT_TRADING_BASE_URL } from './grvt-config.js';
+
+const MARKET_DATA_URL = GRVT_MARKET_DATA_BASE_URL;
+const TRADING_URL = GRVT_TRADING_BASE_URL;
 
 // Tipos para las respuestas de la API
 export interface Balance {

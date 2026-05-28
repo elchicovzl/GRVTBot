@@ -7,6 +7,7 @@ import http from 'http';
 import https from 'https';
 import dotenv from 'dotenv';
 import { Agent, fetch as undiciFetch } from 'undici';
+import { GRVT_EDGE_BASE_URL } from './grvt-config.js';
 
 dotenv.config();
 
@@ -49,7 +50,7 @@ let authState: AuthState = createEmptyAuthState();
 
 /**
  * Login a GRVT usando API key - flow verificado por Marta
- * POST https://edge.grvt.io/auth/api_key/login
+ * POST {GRVT_EDGE_BASE_URL}/auth/api_key/login (mainnet o testnet según GRVT_ENV)
  * Response: Set-Cookie: gravity=XXX + X-Grvt-Account-Id: XXX
  */
 export async function authenticateGRVT(): Promise<boolean> {
@@ -62,7 +63,7 @@ export async function authenticateGRVT(): Promise<boolean> {
     }
 
     // Login request con IPv4 agent
-    const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
+    const response = await fetchIPv4(`${GRVT_EDGE_BASE_URL}/auth/api_key/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -295,7 +296,7 @@ export async function authenticateWithKey(
   state: AuthState
 ): Promise<boolean> {
   try {
-    const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
+    const response = await fetchIPv4(`${GRVT_EDGE_BASE_URL}/auth/api_key/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

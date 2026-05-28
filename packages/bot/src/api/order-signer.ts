@@ -4,14 +4,16 @@
 
 import { SignTypedDataVersion, signTypedData } from '@metamask/eth-sig-util';
 import dotenv from 'dotenv';
+import { GRVT_CHAIN_ID } from './grvt-config.js';
 
 dotenv.config();
 
 // EIP-712 Domain para GRVT Exchange
+// chainId: 325 mainnet, 326 testnet — switched via GRVT_ENV
 const EIP712_DOMAIN = {
   name: 'GRVT Exchange',
   version: '0',
-  chainId: 325, // GRVT Production chainId
+  chainId: GRVT_CHAIN_ID,
 };
 
 // EIP-712 Types para Order

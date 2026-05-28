@@ -16,6 +16,7 @@ import { grvtClient } from '../api/client.js';
 import { db } from '../database/db.js';
 import { gridEngine } from '../bot/grid-engine.js';
 import { getAuthStatus, authenticatedRequest } from '../api/auth.js';
+import { GRVT_TRADING_BASE_URL } from '../api/grvt-config.js';
 import { mountV2 } from '../server/v2-bootstrap.js';
 
 dotenv.config();
@@ -334,7 +335,7 @@ app.get('/api/benchmark', async (req, res) => {
     let balance = 0;
     let equity = 0;
     try {
-      const summary = await authenticatedRequest(`${process.env.GRVT_TRADING_URL || 'https://trades.grvt.io/full/v1'}/account_summary`, {
+      const summary = await authenticatedRequest(`${process.env.GRVT_TRADING_URL || GRVT_TRADING_BASE_URL}/account_summary`, {
         sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID || '3931648923440974'
       });
       balance = parseFloat(summary.spot_balances?.[0]?.balance || '0');
@@ -657,7 +658,7 @@ app.post('/api/bots/:id/compound/execute', async (req, res) => {
     let gridProfit = (bot as any).grid_profit_usdt || 0;
     try {
       const { authenticatedRequest } = await import('../api/auth.js');
-      const summary = await authenticatedRequest('https://trades.grvt.io/full/v1/account_summary', { sub_account_id: '3931648923440974' });
+      const summary = await authenticatedRequest(`${GRVT_TRADING_BASE_URL}/account_summary`, { sub_account_id: '3931648923440974' });
       const balance = parseFloat(summary.spot_balances?.[0]?.balance || '0');
       const investment = (bot as any).investment_usdt || 670;
       gridProfit = balance - investment; // Real profit = balance - what we put in
@@ -1214,7 +1215,7 @@ async function calculateRealPnL(botId: number): Promise<{
     let grvtBalance = 0;
     try {
       const { authenticatedRequest } = await import('../api/auth.js');
-      const summary = await authenticatedRequest('https://trades.grvt.io/full/v1/account_summary', {sub_account_id: '3931648923440974'});
+      const summary = await authenticatedRequest(`${GRVT_TRADING_BASE_URL}/account_summary`, {sub_account_id: '3931648923440974'});
       grvtEquity = parseFloat(summary.total_equity) || 0;
       grvtBalance = parseFloat(summary.spot_balances?.[0]?.balance) || 0;
       const unrealizedPnl = parseFloat(summary.unrealized_pnl) || 0;
@@ -1243,7 +1244,7 @@ async function calculateRealPnL(botId: number): Promise<{
         )`);
         
         // Sync fills from API
-        const fillsResp = await authenticatedRequest('https://trades.grvt.io/full/v1/fill_history', {
+        const fillsResp = await authenticatedRequest(`${GRVT_TRADING_BASE_URL}/fill_history`, {
           sub_account_id: '3931648923440974', limit: 1000
         });
         const apiFills = fillsResp.results || fillsResp;

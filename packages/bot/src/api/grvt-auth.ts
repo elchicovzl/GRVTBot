@@ -2,10 +2,11 @@
 // Implementa cookie-based auth según la documentación de GRVT
 
 import dotenv from 'dotenv';
+import { GRVT_TRADING_BASE_URL } from './grvt-config.js';
 
 dotenv.config();
 
-const TRADING_BASE_URL = 'https://trades.grvt.io/full/v1';
+const TRADING_BASE_URL = GRVT_TRADING_BASE_URL;
 
 interface AuthState {
   cookies: string;
