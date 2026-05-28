@@ -178,12 +178,6 @@ app.use(
 );
 app.use(express.json());
 
-// Debug logging middleware
-app.use((req, res, next) => {
-  console.log(`🔧 [DEBUG] ${req.method} ${req.path}`);
-  next();
-});
-
 // Health endpoint BEFORE auth (for external monitoring)
 app.get('/api/health', async (req, res) => {
   try {
