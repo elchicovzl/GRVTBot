@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from 'react';
 import { api, setAuthToken, clearAuthToken } from './api-client';
+import { wsClient } from './ws-client';
 
 const TOKEN_KEY = 'grvt-grid-token';
 
@@ -50,6 +51,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(TOKEN_KEY, t);
     setAuthToken(t);
     setToken(t);
+    // Reconnect the WS with the new JWT so live updates resume after login.
+    wsClient.authChanged();
   }, []);
 
   const logout = useCallback(() => {
@@ -57,6 +60,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearAuthToken();
     setToken(null);
     setUser(null);
+    // Drop the WS connection so it doesn't keep streaming as the prior user.
+    wsClient.authChanged();
   }, []);
 
   const refreshMe = useCallback(async () => {

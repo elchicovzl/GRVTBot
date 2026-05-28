@@ -1,7 +1,8 @@
 // Singleton WebSocket connection manager.
 //
 // Mirrors the protocol of packages/bot/src/server/ws-server.ts:
-//   - URL: ws[s]://host/ws?api_key=<key>
+//   - URL: ws[s]://host/ws?token=<jwt>     (multi-tenant — preferred)
+//          ws[s]://host/ws?api_key=<key>   (legacy operator/admin)
 //   - Server sends `hello` on connect, `pong` on app-level ping
 //   - Client subscribes to channels via { type: 'subscribe', channels: [...] }
 //   - All frames JSON: { type, channel, data, timestamp }
@@ -9,6 +10,13 @@
 // Reconnection: exponential backoff, capped. The hook layer (use-ws-channel)
 // re-issues subscribe frames after every reconnect so consumers don't have to
 // know about disconnect events.
+//
+// Auth lifecycle: the URL is built fresh on every connect() so that the
+// current JWT (from localStorage) is picked up. After login/logout the
+// auth context calls authChanged() to drop the old socket and reconnect
+// with the new credentials.
+
+const TOKEN_KEY = 'grvt-grid-token';
 
 export type WsStatus = 'connecting' | 'open' | 'closed' | 'error';
 
@@ -26,7 +34,6 @@ const RECONNECT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 
 class WsClient {
   private ws: WebSocket | null = null;
-  private url: string;
   private status: WsStatus = 'closed';
   private channelListeners = new Map<string, Set<Listener>>();
   private statusListeners = new Set<StatusListener>();
@@ -35,9 +42,14 @@ class WsClient {
   private intentionallyClosed = false;
   private appPingTimer: number | null = null;
 
-  constructor() {
-    // Build WS URL based on Vite env. In dev, point at the same origin so
-    // the Vite proxy handles upgrades. In prod, allow override via env.
+  /**
+   * Build the WS URL fresh each call so we pick up the current JWT from
+   * localStorage (after login/logout). Prefers token= (multi-tenant)
+   * over api_key= (legacy operator/admin baked in at build time).
+   */
+  private buildUrl(): string {
+    const token =
+      typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
     const apiKey = import.meta.env.VITE_DASHBOARD_API_KEY ?? '';
     const baseOverride = import.meta.env.VITE_API_BASE_URL ?? '';
     let wsBase: string;
@@ -49,7 +61,10 @@ class WsClient {
     } else {
       wsBase = 'ws://localhost:3848';
     }
-    this.url = `${wsBase}/ws?api_key=${encodeURIComponent(apiKey)}`;
+    if (token) {
+      return `${wsBase}/ws?token=${encodeURIComponent(token)}`;
+    }
+    return `${wsBase}/ws?api_key=${encodeURIComponent(apiKey)}`;
   }
 
   /**
@@ -61,7 +76,7 @@ class WsClient {
     this.setStatus('connecting');
 
     try {
-      this.ws = new WebSocket(this.url);
+      this.ws = new WebSocket(this.buildUrl());
     } catch (err) {
       console.error('[ws] failed to construct WebSocket', err);
       this.setStatus('error');
@@ -100,9 +115,19 @@ class WsClient {
         this.setStatus('closed');
         return;
       }
-      // 4401 = unauthorized, don't retry blindly
+      // 4401 = unauthorized, don't retry blindly. In multi-tenant this
+      // means we either have no JWT (user not logged in yet) or the
+      // server rejected it (expired, signed with the wrong secret, etc).
+      // In single-tenant operator mode it means VITE_DASHBOARD_API_KEY
+      // baked into the build doesn't match the server.
       if (event.code === 4401) {
-        console.error('[ws] unauthorized — check VITE_DASHBOARD_API_KEY');
+        const hasJwt =
+          typeof localStorage !== 'undefined' && !!localStorage.getItem(TOKEN_KEY);
+        console.error(
+          hasJwt
+            ? '[ws] unauthorized — JWT rejected by server'
+            : '[ws] unauthorized — log in first (no JWT in localStorage)'
+        );
         this.setStatus('error');
         return;
       }
@@ -163,6 +188,39 @@ class WsClient {
 
   getStatus(): WsStatus {
     return this.status;
+  }
+
+  /**
+   * Call after login or logout. Drops the current socket (without
+   * marking it as intentionally closed forever) and reconnects with
+   * fresh credentials if anyone is still subscribed. If no subscribers,
+   * lets lazy connect handle it next time a hook subscribes.
+   */
+  authChanged(): void {
+    // Cancel any pending reconnect; we're about to trigger one explicitly.
+    if (this.reconnectTimer != null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempt = 0;
+    if (this.ws) {
+      // Close the current socket. We use a transient "intentionallyClosed"
+      // window so the close handler doesn't immediately schedule a
+      // reconnect with stale state — we'll trigger a fresh connect below.
+      this.intentionallyClosed = true;
+      try {
+        this.ws.close(1000, 'auth change');
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+      this.intentionallyClosed = false;
+    }
+    if (this.channelListeners.size > 0) {
+      this.connect();
+    } else {
+      this.setStatus('closed');
+    }
   }
 
   /**
