@@ -25,7 +25,7 @@ COPY package.json package-lock.json ./
 COPY packages/bot/package.json packages/bot/
 COPY packages/bot/tsconfig.json packages/bot/
 
-RUN npm ci --workspace=@grvt-grid/bot --include-workspace-root
+RUN npm ci --workspace=@grvt-grid/bot --include-workspace-root --build-from-source=sqlite3
 
 # Now copy the source and build
 COPY packages/bot/src packages/bot/src
