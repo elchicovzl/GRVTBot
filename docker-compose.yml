@@ -39,10 +39,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs/bot:/app/logs
-    ports:
-      # Direct port for `--profile no-tls` deployments. With caddy, you can
-      # remove this binding so only caddy is reachable from the internet.
-      - "${BOT_PORT:-3848}:3848"
+      - /etc/grvt-grid/master.key:/etc/grvt-grid/master.key:ro
+    expose:
+      - "3848"
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://127.0.0.1:3848/api/health"]
       interval: 30s
@@ -82,23 +81,5 @@ services:
       start_period: 30s
     profiles: ["full", "with-notifier"]
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: grvt-grid-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    depends_on:
-      bot:
-        condition: service_healthy
-    profiles: ["full", "with-tls"]
-
 volumes:
   notifier-state:
-  caddy-data:
-  caddy-config:
