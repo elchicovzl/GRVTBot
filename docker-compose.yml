@@ -37,8 +37,8 @@ services:
       DASHBOARD_PORT: "3848"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     volumes:
-      - ./data:/app/data
-      - ./logs/bot:/app/logs
+      - bot-data:/app/data
+      - bot-logs:/app/logs
       - /etc/grvt-grid/master.key:/etc/grvt-grid/master.key:ro
     expose:
       - "3848"
@@ -67,9 +67,9 @@ services:
       NOTIFIER_HEALTH_PORT: "3849"
     volumes:
       # READ-ONLY mount of the bot's data dir — defense in depth.
-      - ./data:/shared-data:ro
+      - bot-data:/shared-data:ro
       - notifier-state:/var/lib/grvt-grid-notifier
-      - ./logs/notifier:/app/logs
+      - notifier-logs:/app/logs
     depends_on:
       bot:
         condition: service_started
@@ -82,4 +82,7 @@ services:
     profiles: ["full", "with-notifier"]
 
 volumes:
+  bot-data:
+  bot-logs:
   notifier-state:
+  notifier-logs:
