@@ -2336,7 +2336,7 @@ export class GridBotInstance {
       const safeBuyPrice = Math.floor(askPrice * 1.001 * 100) / 100; // 0.1% arriba del ask, rounded to tick
 
       const order = await this.grvt.createOrder({
-        sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
+        sub_account_id: this.grvt.subAccountId,
         instrument: this.bot.pair,
         size: (Math.floor(totalQuantityNeeded * 100) / 100).toString(), // Round to 0.01
         price: safeBuyPrice.toString(),
@@ -2586,7 +2586,7 @@ export class GridBotInstance {
       log.info(`💰 [DEBUG] REAL MODE - Enviando orden a GRVT con nuevo createOrder...`);
       
       const order = await this.grvt.createOrder({
-        sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
+        sub_account_id: this.grvt.subAccountId,
         instrument: this.bot.pair,
         size: level.quantity.toString(),
         price: level.price.toString(),
