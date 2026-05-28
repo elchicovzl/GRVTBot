@@ -221,11 +221,18 @@ export class GRVTClient {
     if (creds) {
       this.tradingAccountId = creds.subAccountId;
     } else {
-      // Legacy fallback: read from env.
+      // Legacy fallback: read from env. In multi-tenant deploys none of
+      // the GRVT_* env vars are set (each user supplies their own creds
+      // via the dashboard). The legacy singleton may still be imported
+      // but its tradingAccountId is never used for order placement —
+      // defer the validation to actual use, only throw at construction
+      // when the operator clearly intended legacy mode (some env var is
+      // set but the account id is missing).
       const isMockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
+      const legacyEnvIntent = !!(process.env.GRVT_API_KEY || process.env.GRVT_API_SECRET || process.env.GRVT_TRADING_ADDRESS);
       this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (isMockMode ? 'mock-account' : '');
-      if (!this.tradingAccountId) {
-        throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env (set MOCK_MODE=true to bypass for development)');
+      if (!this.tradingAccountId && legacyEnvIntent) {
+        throw new Error('GRVT_TRADING_ACCOUNT_ID required when using legacy env-based auth (other GRVT_* env vars are set). Set MOCK_MODE=true to bypass.');
       }
     }
   }
