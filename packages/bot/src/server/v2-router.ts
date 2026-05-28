@@ -23,7 +23,7 @@ import { signToken, verifyToken } from '../auth/jwt.js';
 import { encryptCredentialFields } from '../auth/crypto.js';
 import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
 import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
-import { invalidateGrvtClient } from '../api/grvt-client-factory.js';
+import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -1112,11 +1112,16 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       ORDER BY level_index
     `, [id]);
 
-    // Live data from GRVT (cached 2s).
+    // Live data from GRVT (cached 2s). Use the per-user client so that
+    // multi-tenant deploys don't hit the env-based singleton (which has
+    // no creds and would throw on authed calls like getPosition /
+    // getOpenOrders). getTicker is public but routing it through the
+    // user client keeps the call site uniform.
+    const userGrvt = await getGrvtClientForUser(req.userId!, gridBotDb);
     const [ticker, position, openOrders] = await Promise.all([
-      cache.getOrFetch(`ticker:${bot.pair}`, 2_000, () => grvtClient.getTicker(bot.pair)),
-      cache.getOrFetch(`position:${bot.pair}`, 2_000, () => grvtClient.getPosition(bot.pair)),
-      cache.getOrFetch(`openOrders:${bot.pair}`, 2_000, () => grvtClient.getOpenOrders(bot.pair))
+      cache.getOrFetch(`ticker:${bot.pair}`, 2_000, () => userGrvt.getTicker(bot.pair)),
+      cache.getOrFetch(`position:u${req.userId}:${bot.pair}`, 2_000, () => userGrvt.getPosition(bot.pair)),
+      cache.getOrFetch(`openOrders:u${req.userId}:${bot.pair}`, 2_000, () => userGrvt.getOpenOrders(bot.pair))
     ]);
 
     res.json({
@@ -1183,9 +1188,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   }));
 
   // ── GET /api/v2/balance ───────────────────────────────────────────
-  // Cached 2s.
-  router.get('/balance', asyncHandler(async (_req, res) => {
-    const data = await cache.getOrFetch('balance', 2_000, () => grvtClient.getBalance());
+  // Cached 2s per-user (each user has their own GRVT account).
+  router.get('/balance', asyncHandler(async (req, res) => {
+    const userGrvt = await getGrvtClientForUser(req.userId!, gridBotDb);
+    const data = await cache.getOrFetch(`balance:u${req.userId}`, 2_000, () => userGrvt.getBalance());
     res.json({ balance: data });
     return;
   }));
