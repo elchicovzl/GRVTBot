@@ -24,6 +24,7 @@ import { encryptCredentialFields } from '../auth/crypto.js';
 import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
 import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
 import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
+import { computeQtyPerLevel } from '../bot/grid-engine.js';
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -1766,20 +1767,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     // position by 0.17 ETH on a 6-min run. Single source of truth now.
     const spacing = (upper - lower) / (grids - 1);
     const notional = investment * leverage;
-    const ORDER_ALLOC = 0.75;
     const midPrice = (upper + lower) / 2;
-    const effCap = investment * leverage * ORDER_ALLOC;
-    const minSize = pair === 'ETH_USDT_Perp' ? 0.01 : 0.001;
-    let qtyPerLevel = Math.max(
-      Math.ceil((effCap / grids / midPrice) * 100) / 100,
-      0.03
-    );
-    // Floor on min notional at the lower price (safety net; usually no-op).
-    const minNotional = pair === 'ETH_USDT_Perp' ? 20 : 100;
-    while (qtyPerLevel * lower < minNotional) {
-      qtyPerLevel += minSize;
-    }
-    qtyPerLevel = Math.round(qtyPerLevel * 100) / 100;
+    // Single source of truth: delegate to the engine's canonical formula so
+    // the wizard preview EXACTLY matches the qty the bot actually places.
+    // This previously duplicated the formula with a hardcoded minNotional
+    // (20/100), which diverged from getInstrumentSpec() and inflated the
+    // shown qty/profit ~5x for pairs absent from the spec table (e.g. BNB,
+    // which falls back to min_notional 5). See grid-engine.computeQtyPerLevel.
+    const qtyPerLevel = computeQtyPerLevel(investment, leverage, grids, midPrice, pair);
     const profitPerRoundTrip = qtyPerLevel * spacing;
 
     // Estimated liquidation: simplified — actual depends on funding/fees.
