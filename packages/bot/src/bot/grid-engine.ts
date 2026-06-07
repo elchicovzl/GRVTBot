@@ -1,7 +1,7 @@
 // Grid Trading Engine - Fase 3
 // Lógica completa de grid trading con safeguards para dinero real
 
-import { grvtClient, type GRVTClient, getInstrumentSpec } from '../api/client.js';
+import { grvtClient, type GRVTClient, type Balance, getInstrumentSpec } from '../api/client.js';
 import { getGrvtClientForBot, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
@@ -327,6 +327,128 @@ export function decideCompound(
 // don't have to fetch positions on every monitor loop. Verify per pair
 // if GRVT ever publishes per-symbol margin tiers.
 const SAFEGUARD_MAINTENANCE_MARGIN = 0.005;
+
+// ── LEVERAGE FAIL-CLOSED SAFEGUARD (DINERO REAL) ────────────────────────
+// GRVT's set_leverage is "sticky": if a call is rejected the account keeps
+// the PREVIOUS leverage while the DB/dashboard show the intended value, so
+// the bot would trade at the wrong leverage. We fail-closed:
+//   1. Abort start if setLeverage() returns false (no orders placed).
+//   2. Read back the applied leverage from GRVT account_summary and assert
+//      it matches the bot's intended leverage before placing orders.
+// Default ON. GRVT only exposes per-instrument leverage once a position
+// exists, so the read-back can only assert when there's a position; pre-
+// position we rely on a confirmed setLeverage() + re-assertion on resume.
+const LEVERAGE_CHECK_ENABLED = true;
+// Tolerance for the applied-vs-intended leverage comparison. GRVT echoes
+// integer leverage; a small epsilon absorbs float parse noise (e.g. "10.0").
+const LEVERAGE_MATCH_EPSILON = 0.01;
+
+// ── CLOSE FLATTEN-VERIFY SAFEGUARD (DINERO REAL) ────────────────────────
+// createOrder() en GRVT devuelve "aceptada", NO "ejecutada". Antes de marcar
+// el bot como 'stopped' (y por ende eliminable, lo que dispara CASCADE y
+// abandona la exposición), verificamos que la posición quedó realmente plana
+// re-consultando getPositions(). Si no flatea dentro del límite, dejamos el
+// bot fail-closed (NO 'stopped'), conservamos el tamaño residual real en DB y
+// emitimos una alerta. Default ON.
+const CLOSE_VERIFY_ENABLED = true;
+// Cuántas veces re-precificamos la orden de cierre (cancel-before-replace) con
+// precio cada vez más agresivo antes de rendirnos. Acotado para evitar
+// slippage/fees descontrolados.
+const CLOSE_MAX_REPRICE_RETRIES = 3;
+// Cuántas veces hacemos poll de la posición tras cada (re)colocación antes de
+// re-precificar. Total de polls ≈ (RETRIES+1) * POLLS_PER_ATTEMPT.
+const CLOSE_POLLS_PER_ATTEMPT = 6;
+// Espera entre polls de posición (ms). 6 polls * 500ms = ~3s por intento.
+const CLOSE_POLL_INTERVAL_MS = 500;
+// Agresividad base del precio de cierre (0.5% peor que mark, igual que el
+// comportamiento previo) y el incremento por cada re-precificación.
+const CLOSE_PRICE_AGGRESSION_PCT = 0.005;
+const CLOSE_PRICE_AGGRESSION_STEP_PCT = 0.005;
+// Multiplicador del min_size del instrumento que consideramos "polvo" (dust):
+// un residual <= min_size * este factor se trata como plano (GRVT no permite
+// cerrar por debajo de min_size de todos modos).
+const CLOSE_DUST_MIN_SIZE_FACTOR = 1.0;
+// GRVT suele devolver order_id='0x00' en create. Antes de guardar el id de la
+// orden de cierre esperamos este lapso para que GRVT procese y aparezca en
+// open_orders, donde la matcheamos por precio (mismo fallback que placeGridOrder).
+const CLOSE_ORDER_ID_RESOLVE_WAIT_MS = 1000;
+// Tolerancia de precio (en unidades de quote) para matchear la orden de cierre
+// en open_orders cuando resolvemos un 0x00. El precio de cierre se floorea a 2
+// decimales, así que 1.0 es holgado y suficiente para identificarla unívocamente.
+const CLOSE_ORDER_ID_PRICE_MATCH_TOL = 1.0;
+
+// ── INITIAL-PURCHASE / NAKED-SHORT SAFEGUARD (DINERO REAL) ──────────────────
+// En un grid LONG, la compra inicial (IOC) debe dejar inventario suficiente
+// para respaldar TODOS los sells de toma de ganancia. Si el IOC no llena (0
+// fills o parcial) y igual colocáramos los sells, en un PERP esos sells abren
+// un SHORT no deseado. Dos defensas (default ON):
+//   1. Tras el IOC leemos la posición NETA AUTORITATIVA via getPosition()
+//      (NO matcheamos por order_id, que GRVT devuelve poco fiable). Si el
+//      llenado < necesario * (1 - tolerancia), abortamos ANTES de colocar
+//      ningún sell (throw), tras cancelar/flatear el parcial. La lectura de
+//      posición es autoritativa y CON REINTENTOS; si falla la lectura,
+//      fallamos ruidoso (fail-closed).
+//   2. Marcamos reduce_only TODOS los sells de toma de ganancia del grid LONG
+//      (ver placeGridOrder) para que un sell jamás pueda abrir un short por
+//      construcción, incluso si la defensa #1 fuese evadida.
+const INITIAL_FILL_VERIFY_ENABLED = true;
+// Tolerancia del llenado: aceptamos hasta este faltante relativo (por rounding
+// de tamaño a min_size y por el dust epsilon de GRVT) antes de considerar la
+// compra inicial "corta". 1% absorbe el redondeo del size a 0.01 sin tolerar
+// un short real.
+const INITIAL_FILL_TOLERANCE = 0.01;
+// Reintentos de la lectura autoritativa de posición tras el IOC. La posición
+// puede tardar un instante en propagar; reintentamos antes de fallar.
+const INITIAL_FILL_POSITION_RETRIES = 3;
+// Espera entre reintentos de la lectura de posición (ms).
+const INITIAL_FILL_POSITION_RETRY_MS = 1000;
+// reduce_only en los sells de toma de ganancia del grid LONG. Default ON:
+// hace imposible por construcción que un sell del grid abra un short en PERP.
+const GRID_SELL_REDUCE_ONLY_ENABLED = true;
+
+// ── CROSS-MARGIN BRAKE / HEADROOM SAFEGUARD (DINERO REAL) ───────────────────
+// El margen se validaba UNA sola vez al arranque fresco y NUNCA más. No había
+// chequeo de headroom por-orden, ni tope de notional, y el rechazo de GRVT
+// "cross margin balance insufficient" NO se detectaba (placeGridOrder solo
+// manejaba 7201/min_notional), así que se tragaba y el loop seguía colocando
+// — armando medio grid sobre una cuenta ya exhausta. Tres frenos (default ON):
+//   1. HEADROOM: antes de cada BUY proyectamos el margen comprometido (posición
+//      + niveles BUY resting + esta orden) y rechazamos si superaría el
+//      MARGIN_HEADROOM_CAP del total_equity (deja un colchón). Los SELL que
+//      REDUCEN posición (reduce_only del grid LONG) JAMÁS se bloquean.
+//   2. INSUFFICIENT-MARGIN: si GRVT rechaza por margen insuficiente, NO
+//      reintentamos: lanzamos un error estructurado 'MARGIN:pause' que
+//      monitorAllBots rutea al pause path (igual que 'SAFEGUARD:pause_close').
+//   3. MAX-NOTIONAL: tope duro de notional anclado en original_investment_usdt
+//      (NO investment_usdt, que sube por compound) * leverage * safetyFactor.
+//      Solo aplica a BUYs; los SELL que reducen siempre se permiten.
+const MARGIN_BRAKE_ENABLED = true;
+// Tope de headroom: el bot DEBE dejar de colocar BUYs cuando el margen
+// comprometido proyectado superaría este % del total_equity (deja 20% colchón).
+// USER-CHOSEN.
+const MARGIN_HEADROOM_CAP = 0.80;
+// Cache TTL (ms) de getBalance() para el chequeo de headroom. Una lectura REST
+// por orden saturaría el rate limiter; cacheamos ~4s para amortiguar ráfagas de
+// colocación sin quedar peligrosamente desactualizados.
+const MARGIN_BALANCE_CACHE_MS = 4000;
+// Aunque el TTL no haya expirado, forzamos una re-lectura de balance cada N
+// chequeos de headroom para no derivar del estado real (depósitos/retiros/
+// funding) durante operaciones largas. Belt-and-suspenders del TTL.
+const MARGIN_REBALANCE_READ_EVERY = 10;
+// Tope de notional como múltiplo de la base de capital ORIGINAL. Anclado en
+// original_investment_usdt (inmutable) para que NO se infle silenciosamente vía
+// compound (que sube investment_usdt). Solo aplica a BUYs.
+const MAX_NOTIONAL_CAP_ENABLED = true;
+// ⚠️ DEFAULT TENTATIVO — confirmar con el usuario/GRVT. 1.5x deja margen para
+// el rebalanceo normal del grid + algo de compound sin permitir que el notional
+// se duplique respecto al capital original.
+const MAX_NOTIONAL_SAFETY_FACTOR = 1.5;
+// ⚠️ SIGNATURE NO CONFIRMADA contra un rechazo REAL de GRVT. El cliente lanza
+// `HTTP <status>: <errorText>` con el body crudo de GRVT, así que matcheamos el
+// texto del rechazo. No conocemos el string/código exacto de "margen
+// insuficiente" de GRVT, así que matcheamos amplio y case-insensitive. DEBE
+// confirmarse contra un rechazo real (ver flagged en el resumen).
+const INSUFFICIENT_MARGIN_RE = /insufficient.*margin|margin.*insufficient|cross.?margin.*(insufficient|balance)/i;
 
 /**
  * Local estimate of liquidation price for the safeguard check. Uses the
@@ -871,7 +993,7 @@ export class GridEngine extends EventEmitter {
         log.info(
           `🔁 Bot ${botId} RESUME — ${matchingOrders} matching orders + position ${positionSize}. Skipping bootstrap.`
         );
-        await this.resumeBotInstance(bot, instance, existingOrders);
+        await this.resumeBotInstance(bot, instance, existingOrders, client);
       } else {
         if (existingOrders.length > 0) {
           log.info(
@@ -888,8 +1010,11 @@ export class GridEngine extends EventEmitter {
         log.info(`🆕 Bot ${botId} FRESH START — no matching GRVT state, bootstrapping.`);
         // Verificar balance antes de iniciar
         await this.validateSufficientBalance(bot);
-        // Establecer leverage
-        await client.setLeverage(bot.pair, bot.leverage);
+        // Establecer leverage — FAIL-CLOSED (isResume:false). Si GRVT rechaza
+        // el set_leverage, abortamos ANTES de placeInitialOrders. El try/catch
+        // de startBot hace rollback de la instancia en memoria y propaga el
+        // error al usuario.
+        await this.applyAndVerifyLeverage(client, bot, { hasPosition: false, isResume: false });
         // Colocar órdenes iniciales
         await instance.placeInitialOrders();
       }
@@ -910,14 +1035,160 @@ export class GridEngine extends EventEmitter {
   }
 
   /**
+   * Apply the bot's intended leverage to GRVT and FAIL-CLOSED if it can't
+   * be confirmed. Single chokepoint used by fresh-start, resume and restart.
+   *
+   * - setLeverage() rejection (returns false) → throw ON FRESH START (no
+   *   orders placed). On RESUME/RESTART it is NON-FATAL (warn + continue):
+   *   the leverage ya fue establecido en el fresh start y GRVT suele RECHAZAR
+   *   set_leverage cuando hay ÓRDENES abiertas en el instrumento (no sólo con
+   *   posición). Re-asertar al reanudar no debe nukear bots sanos.
+   * - Read-back: GRVT only exposes per-instrument leverage once a position
+   *   exists (account_summary.positions[].leverage). When a position exists
+   *   we ASSERT applied === intended (within epsilon) and throw on mismatch.
+   *   Pre-position GRVT exposes nothing to read back, so we rely on the
+   *   confirmed setLeverage() and re-verify on the next resume/restart (and,
+   *   for fresh starts, on the first resume after a fill creates a position).
+   *
+   * `opts.hasPosition` tells us whether a real GRVT position already exists,
+   * so we only re-apply leverage when needed and know whether to expect a
+   * readable applied value. `opts.isResume` marca el camino resume/restart:
+   * intentamos read-back ANTES (aunque no haya posición) y tratamos un rechazo
+   * de set_leverage como NO fatal.
+   */
+  private async applyAndVerifyLeverage(
+    client: GRVTClient,
+    bot: { id?: number; pair: string; leverage: number },
+    opts: { hasPosition: boolean; isResume?: boolean }
+  ): Promise<void> {
+    if (!LEVERAGE_CHECK_ENABLED) {
+      // Preserva el comportamiento legacy si alguien desactiva el safeguard.
+      await client.setLeverage(bot.pair, bot.leverage);
+      return;
+    }
+
+    const botId = bot.id ?? '?';
+    const isResume = opts.isResume === true;
+
+    // READ-BACK FIRST: en el camino resume/restart (o si ya hay posición)
+    // leemos el leverage aplicado ANTES de tocar set_leverage. Si ya coincide
+    // (dentro del epsilon) hacemos NO-OP — esto evita el set_leverage
+    // innecesario que GRVT suele RECHAZAR cuando hay órdenes/posición abiertas,
+    // que era lo que auto-pausaba bots sanos en cada restart.
+    if (isResume || opts.hasPosition) {
+      let appliedBefore: number | null = null;
+      try {
+        appliedBefore = await client.getAppliedLeverage(bot.pair);
+      } catch (err) {
+        log.warn(
+          `⚠️ Bot ${botId}: no se pudo leer el leverage aplicado en ${bot.pair} antes de re-asertar: ${(err as Error).message}`
+        );
+      }
+      if (
+        appliedBefore != null &&
+        Math.abs(appliedBefore - bot.leverage) <= LEVERAGE_MATCH_EPSILON
+      ) {
+        log.info(
+          `⚡ Bot ${botId}: leverage ya correcto en GRVT (${appliedBefore}x == ${bot.leverage}x). NO-OP (sin set_leverage).`
+        );
+        return;
+      }
+      // appliedBefore == null en resume sin posición es la LIMITACIÓN de GRVT
+      // (no expone el leverage pre-posición): hacemos best-effort set_leverage
+      // abajo y tratamos un rechazo como no fatal. Con posición y mismatch real
+      // sí re-aplicamos (y un mismatch confirmado tras el set sigue siendo fatal).
+      log.warn(
+        `⚠️ Bot ${botId}: leverage en GRVT (${appliedBefore ?? 'desconocido (sin posición / no legible)'}x) != intencionado (${bot.leverage}x). Re-aplicando...`
+      );
+    }
+
+    // Aplicar leverage. FAIL-CLOSED en fresh start; NON-FATAL en resume/restart.
+    const ok = await client.setLeverage(bot.pair, bot.leverage);
+    if (!ok) {
+      if (isResume) {
+        // RESUME/RESTART: GRVT rechazó set_leverage (lo más común: hay órdenes
+        // abiertas en el instrumento). El leverage YA fue establecido en el
+        // fresh start, así que NO fallamos cerrado — sólo avisamos y seguimos
+        // reanudando. Fallar acá auto-pausaría bots sanos en cada restart.
+        log.warn(
+          `⚠️ Bot ${botId}: GRVT rechazó re-aplicar set_leverage (${bot.pair} → ${bot.leverage}x) al reanudar. ` +
+          `NO fatal: el leverage ya se estableció en el fresh start (GRVT suele rechazar set_leverage con órdenes/posición abiertas). ` +
+          `Continuando el resume. Revisá los logs del cliente para el motivo de GRVT.`
+        );
+        return;
+      }
+      throw new Error(
+        `Leverage no aplicado para bot ${botId} (${bot.pair} → ${bot.leverage}x): GRVT rechazó set_leverage. ` +
+        `Abortando para no operar al leverage previo (revisá los logs del cliente para el motivo de GRVT).`
+      );
+    }
+
+    // Read-back: GRVT sólo expone el leverage por instrumento si hay posición.
+    let applied: number | null = null;
+    try {
+      applied = await client.getAppliedLeverage(bot.pair);
+    } catch (err) {
+      log.warn(
+        `⚠️ Bot ${botId}: read-back de leverage falló para ${bot.pair}: ${(err as Error).message}. ` +
+        `setLeverage fue confirmado; se re-verificará en el próximo resume/restart.`
+      );
+      return;
+    }
+
+    if (applied == null) {
+      // Sin posición todavía → GRVT no expone el leverage aplicado. No es un
+      // error: el set_leverage fue confirmado y se re-verifica en resume tras
+      // el primer fill (cuando ya exista posición).
+      log.info(
+        `⚡ Bot ${botId}: leverage ${bot.leverage}x aplicado en ${bot.pair} (set_leverage confirmado; sin posición aún, ` +
+        `read-back pendiente hasta el primer fill).`
+      );
+      return;
+    }
+
+    if (Math.abs(applied - bot.leverage) > LEVERAGE_MATCH_EPSILON) {
+      throw new Error(
+        `Leverage mismatch para bot ${botId} (${bot.pair}): GRVT aplicó ${applied}x pero se esperaba ${bot.leverage}x. ` +
+        `Abortando para no operar al leverage incorrecto.`
+      );
+    }
+
+    log.info(
+      `⚡ Bot ${botId}: leverage ${bot.leverage}x aplicado y VERIFICADO en GRVT (${applied}x).`
+    );
+  }
+
+  /**
    * Rebind an existing GridBotInstance to live GRVT orders. Shared between
    * loadActiveBots() (engine startup) and startBot() (resume path).
    */
   private async resumeBotInstance(
     bot: any,
     instance: GridBotInstance,
-    openOrders: any[]
+    openOrders: any[],
+    client: GRVTClient
   ): Promise<void> {
+    // ── RE-ASERTAR LEVERAGE (resume + restart) ──────────────────────────
+    // El leverage es sticky en GRVT: si entre paradas cambió (manual, otra
+    // herramienta, o un set_leverage previo rechazado), el bot operaría al
+    // leverage equivocado. Re-asertamos en el único chokepoint compartido.
+    // hasPosition se deriva de las posiciones reales de GRVT (no de la DB).
+    // isResume:true → read-back PRIMERO (NO-OP si ya coincide) y rechazo de
+    // set_leverage NO fatal: un bot reanudado tiene órdenes resting pero sin
+    // posición (size=0), y GRVT suele rechazar set_leverage con órdenes
+    // abiertas. Fallar acá auto-pausaría bots sanos en cada restart.
+    let hasPosition = false;
+    try {
+      const pos = await client.getPosition(bot.pair);
+      hasPosition = !!(pos && pos.size && Math.abs(parseFloat(pos.size)) > 0);
+    } catch (err) {
+      log.warn(
+        `⚠️ Bot ${bot.id}: no se pudo leer posición para decidir re-asercion de leverage: ${(err as Error).message}. ` +
+        `Asumiendo sin posición (re-aplicará leverage).`
+      );
+    }
+    await this.applyAndVerifyLeverage(client, bot, { hasPosition, isResume: true });
+
     // Cargar grid levels desde la DB
     await instance.loadGridLevels();
 
@@ -1016,41 +1287,207 @@ export class GridEngine extends EventEmitter {
 
       log.info(`📍 Posición real: ${realPositionSize} (DB: ${bot.position_size})`);
 
-      // Si hay posición abierta, cerrarla con orden agresiva
-      if (realPositionSize !== 0) {
+      // Dust epsilon: por debajo de min_size del instrumento GRVT no deja
+      // operar, así que tratamos ese residual como plano.
+      const { min_size: minSize } = getInstrumentSpec(bot.pair);
+      const dustEpsilon = minSize * CLOSE_DUST_MIN_SIZE_FACTOR;
+
+      // Si no hay posición (o es polvo), marcamos stopped directamente.
+      if (Math.abs(realPositionSize) <= dustEpsilon) {
+        await db.updateBot(botId, { status: 'stopped', position_size: 0 });
+        log.info(`🛑 Bot ${botId} cerrado completamente (sin posición / polvo)`);
+        this.emit('botClosed', { botId });
+        return;
+      }
+
+      // Fallback legacy (verificación deshabilitada): coloca una sola orden
+      // GTC y marca stopped sin confirmar fill. NO recomendado en mainnet —
+      // dejado sólo como escape hatch explícito.
+      if (!CLOSE_VERIFY_ENABLED) {
         const closeSide = realPositionSize > 0 ? 'sell' : 'buy';
-        const closeSize = Math.abs(realPositionSize);
-
-        log.info(`🔄 Cerrando posición: ${closeSide} ${closeSize} ${bot.pair}`);
-
-        // Precio agresivo (0.5% peor que market) con GTC para garantizar fill
+        const closeSize = Math.floor(Math.abs(realPositionSize) * 100) / 100;
         const ticker = await client.getTicker(bot.pair);
         const currentPrice = parseFloat(ticker.last_price);
         const aggressivePrice = closeSide === 'sell'
-          ? Math.floor(currentPrice * 0.995 * 100) / 100   // 0.5% abajo para sell
-          : Math.floor(currentPrice * 1.005 * 100) / 100;  // 0.5% arriba para buy
+          ? Math.floor(currentPrice * (1 - CLOSE_PRICE_AGGRESSION_PCT) * 100) / 100
+          : Math.floor(currentPrice * (1 + CLOSE_PRICE_AGGRESSION_PCT) * 100) / 100;
+        await client.createOrder({
+          sub_account_id: client.subAccountId,
+          instrument: bot.pair,
+          size: closeSize.toString(),
+          price: aggressivePrice.toString(),
+          side: closeSide,
+          type: 'limit',
+          time_in_force: 'gtc',
+          // reduce_only: una orden de cierre SOLO puede reducir la posición.
+          // Aunque este branch legacy no verifica el fill, el flag impide por
+          // construcción que una orden cruzada flipee LONG→SHORT.
+          reduce_only: true
+        }, true);
+        log.info(`✅ Orden de cierre (sin verificación): ${closeSide} ${closeSize} @ $${aggressivePrice} (GTC)`);
+        await db.updateBot(botId, { status: 'stopped', position_size: realPositionSize });
+        log.info(`🛑 Bot ${botId} cerrado (verificación deshabilitada)`);
+        this.emit('botClosed', { botId });
+        return;
+      }
+
+      // ── CIERRE VERIFICADO (DINERO REAL) ──────────────────────────────
+      // Colocamos una orden GTC agresiva y hacemos poll de la posición hasta
+      // confirmar que quedó plana. Si no flatea, re-precificamos (cancel-
+      // before-replace) hasta un máximo acotado. NUNCA stackeamos órdenes de
+      // cierre duplicadas: cancelamos la GTC vieja antes de re-colocar.
+      let lastCloseOrderId: string | null = null;
+      let finalSize = realPositionSize; // se re-fetchea en cada poll
+      let flattened = false;
+
+      for (let attempt = 0; attempt <= CLOSE_MAX_REPRICE_RETRIES && !flattened; attempt++) {
+        // Re-consultar posición antes de re-colocar: pudo haber flateado
+        // mientras esperábamos, o un fill parcial cambió el tamaño/lado.
+        const curPos = (await client.getPositions()).find(p => p.instrument === bot.pair);
+        finalSize = curPos ? parseFloat(curPos.size) : 0;
+        if (Math.abs(finalSize) <= dustEpsilon) {
+          flattened = true;
+          break;
+        }
+
+        const closeSide = finalSize > 0 ? 'sell' : 'buy';
+        const closeSize = Math.floor(Math.abs(finalSize) * 100) / 100;
+
+        // ⚠️ Cancelar la GTC anterior ANTES de re-colocar (no duplicar cierres).
+        // Si tenemos un id resuelto, cancelamos selectivamente. Si el intento
+        // anterior devolvió 0x00 y no lo pudimos resolver (lastCloseOrderId
+        // null pero ya hubo al menos un intento), barremos TODO el par para que
+        // ninguna orden de cierre sin id quede viva y se stackee.
+        if (lastCloseOrderId) {
+          await client.cancelOrder(lastCloseOrderId, bot.pair);
+          lastCloseOrderId = null;
+        } else if (attempt > 0) {
+          try {
+            await client.cancelAllOrders(bot.pair);
+            log.info(`🧹 cancelAllOrders(${bot.pair}) antes de re-colocar (order_id de cierre previo no resuelto / 0x00).`);
+          } catch (e) {
+            log.warn(`No se pudo cancelAllOrders antes de re-colocar: ${(e as Error).message}`);
+          }
+        }
+
+        // Precio agresivo, cada vez más agresivo por re-precificación.
+        const aggression = CLOSE_PRICE_AGGRESSION_PCT + attempt * CLOSE_PRICE_AGGRESSION_STEP_PCT;
+        const ticker = await client.getTicker(bot.pair);
+        const currentPrice = parseFloat(ticker.last_price);
+        const aggressivePrice = closeSide === 'sell'
+          ? Math.floor(currentPrice * (1 - aggression) * 100) / 100   // por debajo para sell
+          : Math.floor(currentPrice * (1 + aggression) * 100) / 100;  // por encima para buy
+
+        log.info(`🔄 Cerrando posición (intento ${attempt + 1}/${CLOSE_MAX_REPRICE_RETRIES + 1}): ${closeSide} ${closeSize} ${bot.pair} @ $${aggressivePrice} (agresividad ${(aggression * 100).toFixed(2)}%)`);
 
         // ⚠️ CRÍTICO: time_in_force debe matchear la firma EIP-712 (GTC = 1).
         // sub_account_id must match the client's own sub-account so
         // multi-tenant orders land on the right wallet.
-        await client.createOrder({
+        // ⚠️ reduce_only: true → una orden de cierre SIEMPRE reduce la posición;
+        // jamás puede abrir/aumentar. Sin esto, dos SELL agresivos cruzándose
+        // (p.ej. tras un id 0x00 que dejó viva una orden previa) podrían flipear
+        // de LONG a SHORT — un short desnudo creado por la rutina de cierre.
+        const closeOrder = await client.createOrder({
           sub_account_id: client.subAccountId,
           instrument: bot.pair,
-          size: (Math.floor(closeSize * 100) / 100).toString(),
+          size: closeSize.toString(),
           price: aggressivePrice.toString(),
           side: closeSide,
           type: 'limit',
-          time_in_force: 'gtc'  // GTC matchea timeInForce=1 en EIP-712
+          time_in_force: 'gtc',  // GTC matchea timeInForce=1 en EIP-712
+          reduce_only: true      // un cierre nunca puede flipear a short
         }, true);
 
-        log.info(`✅ Orden de cierre: ${closeSide} ${closeSize} @ $${aggressivePrice} (GTC)`);
+        // ⚠️ Resolver el order_id real: GRVT suele devolver 0x00 en create.
+        // Si no lo resolvemos, el cancelOrder('0x00') del próximo intento no
+        // cancela nada (cancelOrder swallowea y retorna false) y dejaría una
+        // orden de cierre vieja viva mientras colocamos otra. Mismo fallback
+        // por precio que usa placeGridOrder (~3306-3325).
+        let resolvedCloseOrderId = closeOrder?.order_id ? String(closeOrder.order_id) : null;
+        if (
+          resolvedCloseOrderId === '0x00' ||
+          resolvedCloseOrderId === '0x0000000000000000000000000000000000000000000000000000000000000000'
+        ) {
+          await new Promise((r) => setTimeout(r, CLOSE_ORDER_ID_RESOLVE_WAIT_MS));
+          try {
+            const openOrders = await client.getOpenOrders(bot.pair);
+            const match = openOrders.find((o: any) => {
+              const orderPrice = o.legs?.[0]?.limit_price
+                ? parseFloat(o.legs[0].limit_price)
+                : (o.price ? parseFloat(o.price) : 0);
+              return Math.abs(orderPrice - aggressivePrice) < CLOSE_ORDER_ID_PRICE_MATCH_TOL;
+            });
+            if (match?.order_id && match.order_id !== '0x00') {
+              resolvedCloseOrderId = String(match.order_id);
+              log.info(`[0x00 FIX] Orden de cierre 0x00 → order_id real: ${resolvedCloseOrderId.slice(0, 20)}... @ $${aggressivePrice}`);
+            } else {
+              // No se pudo resolver el id real → no podemos cancelar selectivamente
+              // la orden de este intento. Hacemos cancelAllOrders del par ANTES de
+              // re-colocar (en el próximo intento) para que ninguna orden de cierre
+              // sin id quede viva y se acumule. reduce_only ya garantiza que ningún
+              // cierre flipee a short; esto evita además stackear cierres.
+              resolvedCloseOrderId = null;
+              log.warn(`[0x00 FIX] No se pudo resolver el order_id real de la orden de cierre @ $${aggressivePrice}; se hará cancelAllOrders antes del próximo re-precio.`);
+            }
+          } catch (e) {
+            resolvedCloseOrderId = null;
+            log.warn(`[0x00 FIX] Falló la resolución del order_id de cierre (${(e as Error).message}); se hará cancelAllOrders antes del próximo re-precio.`);
+          }
+        }
+        lastCloseOrderId = resolvedCloseOrderId;
+        log.info(`✅ Orden de cierre enviada: ${closeSide} ${closeSize} @ $${aggressivePrice} (GTC, reduce_only, id=${lastCloseOrderId ?? 'n/d'})`);
+
+        // Poll de la posición esperando el fill.
+        for (let poll = 0; poll < CLOSE_POLLS_PER_ATTEMPT; poll++) {
+          await new Promise((r) => setTimeout(r, CLOSE_POLL_INTERVAL_MS));
+          const pollPos = (await client.getPositions()).find(p => p.instrument === bot.pair);
+          finalSize = pollPos ? parseFloat(pollPos.size) : 0;
+          if (Math.abs(finalSize) <= dustEpsilon) {
+            flattened = true;
+            break;
+          }
+        }
       }
 
-      // Actualizar status a stopped
-      await db.updateBot(botId, { status: 'stopped', position_size: realPositionSize });
+      if (flattened) {
+        // Cancelar cualquier remanente de la orden de cierre por las dudas.
+        if (lastCloseOrderId) {
+          try { await client.cancelOrder(lastCloseOrderId, bot.pair); } catch { /* ya fileada/cancelada */ }
+        }
+        // ⚠️ Persistir el tamaño RE-FETCHEADO post-cierre (no el pre-cierre).
+        await db.updateBot(botId, { status: 'stopped', position_size: 0 });
+        log.info(`🛑 Bot ${botId} cerrado completamente (posición confirmada plana, residual=${finalSize})`);
+        this.emit('botClosed', { botId });
+        return;
+      }
 
-      log.info(`🛑 Bot ${botId} cerrado completamente`);
-      this.emit('botClosed', { botId });
+      // ── NO SE PUDO FLATEAR DENTRO DEL LÍMITE — FAIL CLOSED ───────────
+      // NO marcamos 'stopped' (eso lo haría eliminable y abandonaría la
+      // exposición real). Dejamos la orden de cierre GTC VIVA en GRVT para que
+      // siga intentando flatear, persistimos el tamaño residual REAL y dejamos
+      // el bot en 'paused' (fail-closed): el grid NO se re-arma (la instancia
+      // ya fue removida del mapa por pauseBot) y el delete guard rechazará la
+      // eliminación mientras position_size != 0. Emitimos alerta.
+      // NOTA: el schema de DB sólo permite status IN ('paused','running',
+      // 'stopped'); usamos 'paused' como estado fail-closed en vez de un nuevo
+      // 'closing'/'error' para no requerir una migración de CHECK constraint.
+      await db.updateBot(botId, { status: 'paused', position_size: finalSize });
+      log.error(
+        `🚨 Bot ${botId}: NO se pudo flatear la posición tras ${CLOSE_MAX_REPRICE_RETRIES + 1} intentos. ` +
+        `Residual=${finalSize} ${bot.pair}. Bot dejado en 'paused' (fail-closed); orden de cierre GTC sigue viva (id=${lastCloseOrderId ?? 'n/d'}). ` +
+        `Eliminación bloqueada hasta cerrar la posición.`
+      );
+      this.emit('botCloseFailed', {
+        botId,
+        residualSize: finalSize,
+        pair: bot.pair,
+        closeOrderId: lastCloseOrderId,
+        reason: `position not flat after ${CLOSE_MAX_REPRICE_RETRIES + 1} close attempts`,
+      });
+      throw new Error(
+        `Cierre no confirmado para bot ${botId}: posición residual ${finalSize} ${bot.pair} tras ${CLOSE_MAX_REPRICE_RETRIES + 1} intentos. ` +
+        `Bot dejado en 'paused'; orden de cierre GTC sigue viva. Revisá GRVT manualmente.`
+      );
 
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ Error cerrando bot ${botId}:`);
@@ -1078,7 +1515,7 @@ export class GridEngine extends EventEmitter {
         log.info(`📥 Bot ${bot.id}: ${openOrders.length} órdenes abiertas en GRVT`);
 
         // Shared resume logic with startBot()'s RESUME path.
-        await this.resumeBotInstance(bot, instance, openOrders);
+        await this.resumeBotInstance(bot, instance, openOrders, client);
 
       } catch (error) {
         log.error({ err: (error as Error).message }, `❌ Error cargando bot ${bot.id}:`);
@@ -1128,6 +1565,26 @@ export class GridEngine extends EventEmitter {
           this.emit('safeguardTriggered', {
             botId,
             action,
+            reason: error.message,
+            error: error.message, // legacy field preserved for existing WS consumers
+          });
+        }
+        // FRENO DE CROSS-MARGIN (DINERO REAL): el headroom/max-notional/rechazo
+        // de GRVT por margen insuficiente lanza 'MARGIN:pause:bot=N:...'. Misma
+        // mecánica que SAFEGUARD pero la acción es SIEMPRE pause (nunca auto-
+        // close: cerrar podría requerir margen/colocar órdenes en una cuenta ya
+        // exhausta). Reusa el evento safeguardTriggered para no romper los
+        // consumidores WS existentes.
+        else if (error instanceof Error && error.message.includes('MARGIN:')) {
+          log.info(`🚨 FRENO DE MARGEN activado para bot ${botId} — pausando (no auto-close)`);
+          try {
+            await this.pauseBot(botId);
+          } catch (pauseErr) {
+            log.error({ err: (pauseErr as Error).message }, `❌ Error pausando bot ${botId} por freno de margen:`);
+          }
+          this.emit('safeguardTriggered', {
+            botId,
+            action: 'pause',
             reason: error.message,
             error: error.message, // legacy field preserved for existing WS consumers
           });
@@ -1411,38 +1868,31 @@ export class GridEngine extends EventEmitter {
 
           const client = await this.getClientForBot(bot);
           const fundingPayments = await client.getFundingHistory(50, bot.pair);
-          log.info(`💰 [DEBUG] Bot ${bot.id}: ${fundingPayments.length} funding payments`);
+          log.info(`💰 [DEBUG] Bot ${bot.id}: ${fundingPayments.length} funding snapshots`);
 
-          // Obtener último funding time registrado para evitar duplicados
-          const existingFunding = await db.getFundingHistoryByBot(bot.id);
-          const lastFundingTime = existingFunding.length > 0 ?
-            new Date(existingFunding[0]!.funding_time).getTime() : 0;
-
-          // Filtrar nuevos payments
-          const newPayments = fundingPayments.filter(payment =>
-            payment.funding_time * 1000 > lastFundingTime
-          );
-
-          log.info(`💰 [DEBUG] Bot ${bot.id}: ${newPayments.length} nuevos funding payments`);
-
-          for (const payment of newPayments) {
+          // ⚠️ DINERO REAL: `payment` es el cumulative ACUMULADO de GRVT por
+          // posición (ya en USDT, CON SIGNO), NO un evento per-poll. El código
+          // viejo dividía por 1e6 (→ filas ~$0) y lo insertaba como una fila
+          // NUEVA cada poll en funding_history (→ multi-conteo del acumulado).
+          // Ahora hacemos UPSERT de UN snapshot por (bot, instrumento): el
+          // primer avistamiento fija el baseline, los siguientes solo mueven el
+          // latest. El funding NETO del bot = SUM(latest - baseline) con signo
+          // (ver db.getNetFundingForBot). NO se divide por 1e6, NO Math.abs.
+          for (const payment of fundingPayments) {
             try {
-              // Convertir payment de raw a USDT (÷ 1e6)
-              const paymentUsdt = parseFloat(payment.payment) / 1e6;
+              const cumulativeUsdt = parseFloat(payment.payment); // ya USDT, con signo
 
-              await db.createFundingRecord({
+              await db.upsertFundingSnapshot({
                 bot_id: bot.id,
-                instrument: bot.pair,
-                funding_rate: parseFloat(payment.funding_rate),
-                payment_usdt: paymentUsdt,
-                position_size: parseFloat(payment.position_size),
-                funding_time: new Date(payment.funding_time * 1000).toISOString()
+                instrument: payment.instrument || bot.pair,
+                latestCumulative: cumulativeUsdt,
+                latest_funding_time: new Date(payment.funding_time * 1000).toISOString()
               });
 
-              log.info(`💰 [DEBUG] Funding registrado para bot ${bot.id}: ${paymentUsdt.toFixed(4)} USDT`);
+              log.info(`💰 [DEBUG] Funding snapshot bot ${bot.id} (${payment.instrument || bot.pair}): cumulative=${cumulativeUsdt.toFixed(4)} USDT`);
 
             } catch (fundingErr) {
-              log.error({ err: (fundingErr as Error).message }, `❌ Error registrando funding para bot ${bot.id}:`);
+              log.error({ err: (fundingErr as Error).message }, `❌ Error registrando funding snapshot para bot ${bot.id}:`);
             }
           }
 
@@ -1480,47 +1930,36 @@ export class GridEngine extends EventEmitter {
           log.info(`🔄 [DEBUG] Backfill funding para bot ${bot.id} (${bot.pair})...`);
 
           const client = await this.getClientForBot(bot);
-          // Obtener todo el funding history disponible (últimos 500)
+          // ⚠️ DINERO REAL: GRVT solo expone el cumulative ACUMULADO actual
+          // (account_summary), NO eventos históricos discretos. Con el modelo de
+          // snapshot, el "backfill" se reduce a fijar el BASELINE en el primer
+          // avistamiento (upsert no-op si ya existe el snapshot). Esto significa
+          // que el funding NETO de un bot ya corriendo al deploy arranca en 0 y
+          // solo acumula funding NUEVO desde acá — el funding histórico previo
+          // al deploy NO se reconstruye (fuera de alcance; ver flagged/comentario
+          // en createDailySnapshots). Es la opción CONSERVADORA / fail-safe en
+          // un path de dinero real: no inventamos historia que no podemos pedir.
           const allFunding = await client.getFundingHistory(500, bot.pair);
-          log.info(`🔄 [DEBUG] Bot ${bot.id}: total funding history disponible: ${allFunding.length}`);
+          log.info(`🔄 [DEBUG] Bot ${bot.id}: ${allFunding.length} funding snapshots disponibles`);
 
-          const botCreatedTime = new Date(bot.created_at).getTime();
-
-          // Filtrar funding después de la creación del bot
-          const relevantFunding = allFunding.filter(payment =>
-            payment.funding_time * 1000 >= botCreatedTime
-          );
-
-          log.info(`🔄 [DEBUG] Bot ${bot.id}: ${relevantFunding.length} funding payments relevantes`);
-
-          for (const payment of relevantFunding) {
+          for (const payment of allFunding) {
             try {
-              // Verificar si ya existe este funding
-              const existing = await db.getFundingHistoryByBot(bot.id);
-              const fundingTimeStr = new Date(payment.funding_time * 1000).toISOString();
+              const cumulativeUsdt = parseFloat(payment.payment); // ya USDT, con signo
 
-              if (existing.some(f => f.funding_time === fundingTimeStr)) {
-                continue; // Ya existe, skip
-              }
-
-              // Convertir payment de raw a USDT (÷ 1e6)
-              const paymentUsdt = parseFloat(payment.payment) / 1e6;
-
-              await db.createFundingRecord({
+              // Upsert: fija baseline en el primer insert; no-op si ya existe.
+              await db.upsertFundingSnapshot({
                 bot_id: bot.id,
-                instrument: bot.pair,
-                funding_rate: parseFloat(payment.funding_rate),
-                payment_usdt: paymentUsdt,
-                position_size: parseFloat(payment.position_size),
-                funding_time: fundingTimeStr
+                instrument: payment.instrument || bot.pair,
+                latestCumulative: cumulativeUsdt,
+                latest_funding_time: new Date(payment.funding_time * 1000).toISOString()
               });
 
             } catch (recordErr) {
-              log.error({ err: (recordErr as Error).message }, `❌ Error registrando funding record:`);
+              log.error({ err: (recordErr as Error).message }, `❌ Error registrando funding snapshot:`);
             }
           }
 
-          log.info(`🔄 [DEBUG] Backfill completado para bot ${bot.id}`);
+          log.info(`🔄 [DEBUG] Backfill (baseline) completado para bot ${bot.id}`);
 
           // Throttle between bots
           await new Promise(r => setTimeout(r, 2000));
@@ -1635,6 +2074,35 @@ export class GridEngine extends EventEmitter {
         const oldQty = bot.quantity_per_level || 0;
         log.info(`🔄 Compound bot ${bot.id}: +$${decision.compoundAmount.toFixed(2)} (${bot.compound_pct}% of $${decision.availableProfit.toFixed(2)} profit)`);
         log.info(`   investment: $${bot.investment_usdt.toFixed(2)} → $${decision.newInvestment.toFixed(2)}, qty: ${oldQty} → ${decision.newQty}`);
+
+        // FRENO DE CROSS-MARGIN (DINERO REAL): NO subir el grid si el margen
+        // comprometido del grid AMPLIADO superaría el MARGIN_HEADROOM_CAP del
+        // equity. investment_usdt representa el cash que el grid despliega;
+        // newInvestment/leverage es el margen que ese grid compromete. Si
+        // excede el tope, SALTAMOS el compound (mantenemos el grid actual) en
+        // lugar de comprometernos a un grid que no podemos fondear. Si no
+        // podemos leer el balance, fail-closed: saltamos también (no inflamos a
+        // ciegas en una cuenta de la que no conocemos el headroom).
+        if (MARGIN_BRAKE_ENABLED) {
+          try {
+            const client = await this.getClientForBot(bot);
+            const balance = await client.getBalance();
+            const totalEquity = parseFloat(balance.total_equity || '0');
+            const cap = totalEquity * MARGIN_HEADROOM_CAP;
+            const projectedMargin = decision.newInvestment / (bot.leverage || 1);
+            if (totalEquity <= 0 || projectedMargin > cap) {
+              log.warn(
+                `⏸️ Compound bot ${bot.id} SALTADO por freno de margen: margen del grid ampliado ` +
+                `$${projectedMargin.toFixed(2)} (newInvestment $${decision.newInvestment.toFixed(2)} / ${bot.leverage}x) ` +
+                `superaría el ${(MARGIN_HEADROOM_CAP * 100).toFixed(0)}% del equity ($${cap.toFixed(2)} de $${totalEquity.toFixed(2)})`
+              );
+              continue;
+            }
+          } catch (balErr) {
+            log.warn(`⏸️ Compound bot ${bot.id} SALTADO: no se pudo verificar headroom de margen (${(balErr as Error).message}). Fail-closed: no inflamos el grid a ciegas.`);
+            continue;
+          }
+        }
 
         // Atomic DB update: bump investment AND qty_per_level together.
         // New orders placed by monitor() will use the new qty. Existing
@@ -2080,6 +2548,16 @@ export class GridBotInstance {
   // couldn't resolve a per-user client).
   private injectedClient: GRVTClient | null = null;
 
+  // Cross-margin brake: cache de getBalance() para el chequeo de headroom.
+  // Una lectura REST por orden saturaría el rate limiter durante el bootstrap
+  // (decenas de placeGridOrder seguidos). Cacheamos ~MARGIN_BALANCE_CACHE_MS.
+  // Además forzamos una re-lectura cada MARGIN_REBALANCE_READ_EVERY chequeos
+  // para no derivar del estado real si la cuenta cambia (depósitos/retiros/
+  // funding) durante una operación larga, aunque el TTL no haya expirado.
+  private cachedBalance: Balance | null = null;
+  private cachedBalanceAt = 0;
+  private marginCheckCounter = 0;
+
   constructor(bot: GridBot, client?: GRVTClient) {
     this.bot = bot;
     this.injectedClient = client ?? null;
@@ -2160,6 +2638,178 @@ export class GridBotInstance {
     const rangeMax = levels.length > 0 ? levels[levels.length - 1]!.price : 2450;
     const midPrice = (rangeMin + rangeMax) / 2;
     return Math.max(Math.ceil((effCap / (this.bot.num_grids || 94) / midPrice) * 100) / 100, 0.03);
+  }
+
+  /**
+   * Lectura de balance cacheada para el freno de cross-margin. getBalance()
+   * pega a account_summary vía REST; llamarla por cada placeGridOrder durante
+   * el bootstrap (decenas de órdenes seguidas) dispararía el rate limiter. La
+   * cacheamos MARGIN_BALANCE_CACHE_MS para amortiguar la ráfaga sin quedar
+   * peligrosamente desactualizada. `force` la re-lee igual (lo usamos cada N
+   * órdenes para no derivar demasiado del estado real).
+   */
+  private async getCachedBalance(force = false): Promise<Balance> {
+    const now = Date.now();
+    if (!force && this.cachedBalance && now - this.cachedBalanceAt < MARGIN_BALANCE_CACHE_MS) {
+      return this.cachedBalance;
+    }
+    const balance = await this.grvt.getBalance();
+    this.cachedBalance = balance;
+    this.cachedBalanceAt = now;
+    return balance;
+  }
+
+  /**
+   * FRENO DE CROSS-MARGIN (DINERO REAL). Antes de colocar una orden que ABRE/
+   * AUMENTA exposición (BUY en grid LONG, o el lado que abre en general),
+   * proyectamos el margen comprometido y rechazamos si superaría el
+   * MARGIN_HEADROOM_CAP del total_equity. Esto reemplaza el "validar una sola
+   * vez al arranque" por un chequeo continuo por-orden.
+   *
+   * Margen proyectado = margen YA usado por la cuenta (balance.margin_used, que
+   * cubre la posición abierta) + margen inicial de TODOS los niveles BUY resting
+   * de ESTE bot (size*price/leverage) + el margen inicial de ESTA orden nueva.
+   * Sumamos los BUY resting porque cada uno, al llenarse, consumirá margen: si
+   * solo mirásemos la posición actual seguiríamos colocando hasta agotar la
+   * cuenta cuando todos llenen a la vez.
+   *
+   * ⚠️ ALCANCE — GARANTÍA DE SINGLE-BOT-POR-SUB-ACCOUNT. balance.margin_used es
+   * de toda la sub-cuenta (TODOS los bots/instrumentos), pero restingBuyMargin
+   * SOLO suma los BUY resting de ESTE bot. Por eso el tope del 80% (headroom)
+   * solo es una garantía dura cuando hay UN bot por sub-cuenta. Con varios bots
+   * en la misma sub-cuenta cada engine subproyecta su parte y la suma de todos
+   * podría pasar el 80%. Para ese caso multi-bot el backstop documentado es el
+   * RECHAZO POR MARGEN INSUFICIENTE de GRVT (ver INSUFFICIENT_MARGIN_RE en
+   * placeGridOrder): si la cuenta se agota, GRVT rechaza el create_order y ese
+   * rechazo se rutea al pause path. Una proyección sub-account-aware entre
+   * instancias de engine es un cambio mayor; mientras tanto dependemos del
+   * backstop de GRVT para el caso multi-bot.
+   *
+   * Los SELL que REDUCEN posición (reduce_only del grid LONG) NUNCA se
+   * bloquean — liberan margen, no lo consumen.
+   *
+   * Lanza un error estructurado 'MARGIN:pause' que monitorAllBots rutea al
+   * pause path (mismo patrón que 'SAFEGUARD:pause_close'). Fail-closed: si no
+   * podemos leer el balance, NO bloqueamos por sí solos aquí (la detección de
+   * rechazo de GRVT en placeGridOrder es la red de seguridad dura), pero
+   * logueamos ruidoso.
+   */
+  private async assertMarginHeadroom(
+    side: 'buy' | 'sell',
+    qty: number,
+    price: number,
+    reduceOnly: boolean,
+    // IOC de compra inicial: la orden IOC YA pre-compra el inventario que
+    // respaldan los SELL del grid; sumar además restingBuyMargin (que cubre el
+    // MISMO grid) contaría el lado comprador ~dos veces y sobre-proyectaría el
+    // arranque. En ese caso proyectamos solo (margen usado + esta orden IOC).
+    // Cada BUY resting se revalida igual cuando se coloca en el loop de bootstrap.
+    skipRestingBuys = false,
+  ): Promise<void> {
+    if (!MARGIN_BRAKE_ENABLED) return;
+    // Solo frenamos lo que ABRE/AUMENTA exposición. Un SELL reduce_only del grid
+    // LONG (toma de ganancia) libera margen → siempre permitido. En un grid
+    // SHORT el SELL abre, así que sí lo chequeamos.
+    const opensExposure =
+      (this.bot.direction === 'long' && side === 'buy') ||
+      (this.bot.direction === 'short' && side === 'sell');
+    if (!opensExposure || reduceOnly) return;
+
+    const leverage = this.bot.leverage || 1;
+    // Forzamos re-lectura cada N chequeos (además del TTL) para no derivar del
+    // estado real de la cuenta durante operaciones largas.
+    const force = (++this.marginCheckCounter % MARGIN_REBALANCE_READ_EVERY) === 0;
+    let balance: Balance;
+    try {
+      balance = await this.getCachedBalance(force);
+    } catch (e) {
+      // Fail-closed suave: no podemos proyectar headroom sin balance. NO
+      // bloqueamos en seco aquí (evita falsos positivos por un blip de REST);
+      // la detección de rechazo de GRVT en el catch de placeGridOrder es el
+      // freno duro. Logueamos para que el operador lo vea.
+      log.warn(`⚠️ Bot ${this.bot.id}: headroom check sin balance (${(e as Error).message}); confiando en la detección de rechazo de GRVT.`);
+      return;
+    }
+
+    const totalEquity = parseFloat(balance.total_equity || '0');
+    if (totalEquity <= 0) {
+      log.warn(`⚠️ Bot ${this.bot.id}: total_equity <= 0 en headroom check; saltando proyección.`);
+      return;
+    }
+
+    const marginUsed = parseFloat(balance.margin_used || '0');
+
+    // Margen inicial comprometido por los niveles BUY resting de este bot
+    // (cada uno consumirá margen al llenar). Usamos los niveles en memoria.
+    // - skipRestingBuys: la compra inicial IOC ya cubre el inventario del grid;
+    //   no sumamos los BUY resting para no contar el lado comprador dos veces.
+    // - state==='virtual': esos BUY todavía NO están vivos en GRVT (hasta 500
+    //   niveles, solo ~70 activos). Contarlos haría saltar el freno antes de
+    //   tiempo. Espejamos el guard de colocación (placeInitialOrders).
+    let restingBuyMargin = 0;
+    if (!skipRestingBuys) {
+      for (const lvl of this.gridLevels) {
+        if (this.bot.virtual_enabled && lvl.state === 'virtual') continue;
+        if (lvl.side === 'buy' && !lvl.is_filled) {
+          restingBuyMargin += (lvl.quantity * lvl.price) / leverage;
+        }
+      }
+    }
+
+    const thisOrderMargin = (qty * price) / leverage;
+    const projectedMargin = marginUsed + restingBuyMargin + thisOrderMargin;
+    const cap = totalEquity * MARGIN_HEADROOM_CAP;
+
+    if (projectedMargin > cap) {
+      throw new Error(
+        `MARGIN:pause:bot=${this.bot.id}:headroom — margen proyectado $${projectedMargin.toFixed(2)} ` +
+        `(usado $${marginUsed.toFixed(2)} + BUYs resting $${restingBuyMargin.toFixed(2)} + esta orden $${thisOrderMargin.toFixed(2)}) ` +
+        `superaría el ${(MARGIN_HEADROOM_CAP * 100).toFixed(0)}% del equity ($${cap.toFixed(2)} de $${totalEquity.toFixed(2)})`
+      );
+    }
+  }
+
+  /**
+   * TOPE DE NOTIONAL (DINERO REAL). Cap duro del notional total que el bot
+   * puede tener abierto, anclado en la base de capital ORIGINAL
+   * (original_investment_usdt, INMUTABLE) — NO en investment_usdt, que sube vía
+   * compound y haría que el tope se infle silenciosamente con cada rebalanceo.
+   *
+   * Solo aplica a órdenes que ABREN/AUMENTAN (BUY en grid LONG). Los SELL que
+   * reducen SIEMPRE se permiten (cerrar exposición nunca debe bloquearse).
+   *
+   * Notional proyectado = |posición actual| * price + esta orden. Si superara
+   * el cap, lanzamos 'MARGIN:pause' (mismo ruteo que el headroom).
+   */
+  private assertMaxNotional(
+    side: 'buy' | 'sell',
+    qty: number,
+    price: number,
+    reduceOnly: boolean,
+  ): void {
+    if (!MAX_NOTIONAL_CAP_ENABLED) return;
+    const opensExposure =
+      (this.bot.direction === 'long' && side === 'buy') ||
+      (this.bot.direction === 'short' && side === 'sell');
+    if (!opensExposure || reduceOnly) return;
+
+    // Anclado en el capital ORIGINAL. Si falta (no debería tras la migración
+    // que lo backfillea = investment_usdt), caemos a investment_usdt como
+    // último recurso para no romper bots legacy.
+    const baseCapital = this.bot.original_investment_usdt ?? this.bot.investment_usdt;
+    const leverage = this.bot.leverage || 1;
+    const cap = baseCapital * leverage * MAX_NOTIONAL_SAFETY_FACTOR;
+
+    const positionNotional = Math.abs(this.bot.position_size || 0) * price;
+    const projectedNotional = positionNotional + qty * price;
+
+    if (projectedNotional > cap) {
+      throw new Error(
+        `MARGIN:pause:bot=${this.bot.id}:max_notional — notional proyectado $${projectedNotional.toFixed(2)} ` +
+        `(posición $${positionNotional.toFixed(2)} + esta orden $${(qty * price).toFixed(2)}) ` +
+        `superaría el tope $${cap.toFixed(2)} (capital original $${baseCapital.toFixed(2)} × ${leverage}x × ${MAX_NOTIONAL_SAFETY_FACTOR})`
+      );
+    }
   }
 
   getActiveOrderCount(): number {
@@ -2267,7 +2917,17 @@ export class GridBotInstance {
           // Throttle: 200ms entre órdenes para evitar rate limit GRVT
           await new Promise(r => setTimeout(r, 200));
         } catch (error) {
-          log.error({ err: (error as Error).message }, `❌ [DEBUG] Error colocando orden nivel ${level.level_index}:`);
+          // BOOTSTRAP = CAMINO DE DINERO: CUALQUIER rechazo de create_order es
+          // FATAL y aborta el bootstrap (re-lanzamos → startBot hace rollback y
+          // propaga al usuario). Antes solo re-lanzábamos los 'MARGIN:'; pero
+          // INSUFFICIENT_MARGIN_RE NO está confirmada contra un rechazo real de
+          // GRVT, así que un rechazo por margen que NO matchee el regex caía acá
+          // y solo logueaba+continuaba → medio grid armado sobre una cuenta
+          // exhausta. El bootstrap NUNCA debe tolerar fallos silenciosos por
+          // nivel: si una sola orden falla, abortamos todo y dejamos que el
+          // rollback limpie, en vez de arrancar un grid a medio construir.
+          log.error({ err: (error as Error).message }, `❌ [DEBUG] Error colocando orden nivel ${level.level_index} — bootstrap abortado (fail-closed):`);
+          throw error;
         }
       } else {
         log.info(`❌ [DEBUG] Bot ${this.bot.id}: Nivel ${level.level_index} NO cumple condiciones para colocar`);
@@ -2334,11 +2994,23 @@ export class GridBotInstance {
       const ticker = await this.grvt.getTicker(this.bot.pair);
       const askPrice = parseFloat((ticker as any).best_ask_price || (ticker as any).best_ask || ticker.last_price);
       const safeBuyPrice = Math.floor(askPrice * 1.001 * 100) / 100; // 0.1% arriba del ask, rounded to tick
+      const buyQty = Math.floor(totalQuantityNeeded * 100) / 100; // Round to 0.01
+
+      // FRENO DE CROSS-MARGIN (DINERO REAL): la compra inicial ABRE el long que
+      // respalda los SELL del grid. Proyectamos SOLO el margen del IOC (más el ya
+      // usado por la cuenta): skipRestingBuys=true evita doble-contar el lado
+      // comprador, porque este IOC pre-compra el MISMO inventario que cubren los
+      // BUY resting del grid. Cada BUY resting se revalida cuando se coloca en el
+      // loop de bootstrap (placeGridOrder → assertMarginHeadroom). Un throw
+      // 'MARGIN:pause' aquí aborta el bootstrap (startBot hace rollback) —
+      // fail-closed: no arrancamos si el IOC inicial ya excedería el tope.
+      this.assertMaxNotional('buy', buyQty, safeBuyPrice, false);
+      await this.assertMarginHeadroom('buy', buyQty, safeBuyPrice, false, true);
 
       const order = await this.grvt.createOrder({
         sub_account_id: this.grvt.subAccountId,
         instrument: this.bot.pair,
-        size: (Math.floor(totalQuantityNeeded * 100) / 100).toString(), // Round to 0.01
+        size: buyQty.toString(),
         price: safeBuyPrice.toString(),
         side: 'buy',
         type: 'limit', // IOC es tipo limit con time_in_force especial
@@ -2351,23 +3023,90 @@ export class GridBotInstance {
       // Esperar un momento para que se ejecute
       await new Promise(resolve => setTimeout(resolve, 2000));
 
-      // Verificar si se ejecutó
+      // ── VERIFICACIÓN AUTORITATIVA DEL LLENADO (anti naked-short) ──────────
+      // El IOC reporta "aceptado", NO "llenado". Antes leíamos fills por
+      // order_id (que GRVT devuelve poco fiable: 0x00/undefined) y un 0-fill o
+      // fill parcial solo logueaba un warning y CONTINUABA — colocando luego
+      // sells SIN inventario que respaldarlos, abriendo un SHORT no deseado en
+      // el PERP. Ahora la fuente de verdad es la posición NETA via
+      // getPosition(), con reintentos y fail-closed. Si el llenado quedó corto,
+      // flateamos el parcial y ABORTAMOS (throw) ANTES de colocar ningún sell.
+      // (Defensa #2: los sells del grid LONG van reduce_only — ver placeGridOrder.)
+      let confirmedLong = 0;
+      {
+        let lastReadErr: Error | null = null;
+        let read = false;
+        for (let attempt = 1; attempt <= INITIAL_FILL_POSITION_RETRIES; attempt++) {
+          try {
+            const pos = await this.grvt.getPosition(this.bot.pair);
+            const signed = pos && (pos as any).size ? parseFloat((pos as any).size) : 0;
+            // size firmado: >0 long, <0 short. Solo cuenta el inventario LONG
+            // como respaldo de los sells; un short tras una "compra" es señal
+            // de algo muy mal y NO respalda nada.
+            confirmedLong = signed > 0 ? signed : 0;
+            read = true;
+            lastReadErr = null;
+            // Si ya tenemos suficiente inventario confirmado no seguimos
+            // reintentando; si no, damos tiempo a que GRVT propague el fill.
+            if (!INITIAL_FILL_VERIFY_ENABLED) break;
+            if (confirmedLong >= totalQuantityNeeded * (1 - INITIAL_FILL_TOLERANCE)) break;
+            if (attempt < INITIAL_FILL_POSITION_RETRIES) {
+              await new Promise(r => setTimeout(r, INITIAL_FILL_POSITION_RETRY_MS));
+            }
+          } catch (readErr) {
+            lastReadErr = readErr as Error;
+            log.warn(`⚠️ Bot ${this.bot.id}: lectura de posición tras compra inicial falló (intento ${attempt}/${INITIAL_FILL_POSITION_RETRIES}): ${(readErr as Error).message}`);
+            if (attempt < INITIAL_FILL_POSITION_RETRIES) {
+              await new Promise(r => setTimeout(r, INITIAL_FILL_POSITION_RETRY_MS));
+            }
+          }
+        }
+
+        // Fail-closed: si NUNCA pudimos leer la posición, no sabemos si hay
+        // inventario. Abortamos antes de colocar sells (startBot hace rollback).
+        if (!read && INITIAL_FILL_VERIFY_ENABLED) {
+          await this.flattenInitialPurchase(order.order_id, confirmedLong);
+          throw new Error(
+            `Bot ${this.bot.id}: no se pudo verificar la posición tras la compra inicial ` +
+            `(${lastReadErr?.message ?? 'lectura fallida'}). Abortando bootstrap para no colocar sells sin inventario.`
+          );
+        }
+      }
+
+      // Necesario respaldar TODOS los sells; tolerancia para el rounding del
+      // size a min_size y el dust epsilon de GRVT.
+      const requiredLong = totalQuantityNeeded * (1 - INITIAL_FILL_TOLERANCE);
+      if (INITIAL_FILL_VERIFY_ENABLED && confirmedLong < requiredLong) {
+        // Compra inicial CORTA: flateamos lo poco que haya entrado y abortamos
+        // ANTES de colocar ningún sell. Esto evita el naked short en el PERP.
+        log.error(
+          `🚨 Bot ${this.bot.id}: compra inicial CORTA — inventario confirmado ${confirmedLong} < ` +
+          `requerido ${requiredLong.toFixed(6)} (${totalQuantityNeeded} * (1-${INITIAL_FILL_TOLERANCE})). ` +
+          `Flateando parcial y abortando bootstrap para no abrir un short.`
+        );
+        await this.flattenInitialPurchase(order.order_id, confirmedLong);
+        throw new Error(
+          `Bot ${this.bot.id}: compra inicial no llenó el inventario requerido ` +
+          `(${confirmedLong}/${totalQuantityNeeded} ${this.bot.pair}). Bootstrap abortado para evitar un short no deseado.`
+        );
+      }
+
+      log.info(`✅ [REAL] Bot ${this.bot.id}: Compra inicial confirmada — posición long ${confirmedLong} ${this.bot.pair} (requerido ${requiredLong.toFixed(6)})`);
+
+      // Best-effort: recuperar fills para precio medio real + registrar trades.
+      // YA NO es la fuente de verdad de la verificación (eso es la posición);
+      // si el match por order_id falla, caemos al precio del IOC para el avg.
       const fills = await this.grvt.getFillHistory(10, this.bot.pair!);
-      const initialFills = fills.filter(fill => 
+      const initialFills = fills.filter(fill =>
         fill.order_id === order.order_id && fill.side === 'buy'
       );
 
+      let avgPrice = safeBuyPrice;
       if (initialFills.length > 0) {
-        const totalFilled = initialFills.reduce((sum, fill) => sum + parseFloat(fill.size), 0);
-        const avgPrice = initialFills.reduce((sum, fill) => sum + parseFloat(fill.price) * parseFloat(fill.size), 0) / totalFilled;
-
-        log.info(`✅ [REAL] Bot ${this.bot.id}: Compra inicial ejecutada: ${totalFilled} ETH @ $${avgPrice.toFixed(2)}`);
-
-        // Actualizar posición del bot
-        await db.updateBot(this.bot.id, {
-          position_size: totalFilled,
-          avg_entry_price: avgPrice
-        });
+        const filledByOrderId = initialFills.reduce((sum, fill) => sum + parseFloat(fill.size), 0);
+        if (filledByOrderId > 0) {
+          avgPrice = initialFills.reduce((sum, fill) => sum + parseFloat(fill.price) * parseFloat(fill.size), 0) / filledByOrderId;
+        }
 
         // Registrar trades
         for (const fill of initialFills) {
@@ -2383,8 +3122,14 @@ export class GridBotInstance {
           });
         }
       } else {
-        log.info(`⚠️ [REAL] Bot ${this.bot.id}: Compra inicial no se ejecutó completamente, continuando con órdenes limit`);
+        log.warn(`⚠️ [REAL] Bot ${this.bot.id}: fills por order_id no recuperados (GRVT 0x00/undefined); usando precio IOC $${avgPrice} para avg. La posición autoritativa (${confirmedLong}) es la que manda.`);
       }
+
+      // Persistir la posición AUTORITATIVA (no el match por order_id).
+      await db.updateBot(this.bot.id, {
+        position_size: confirmedLong,
+        avg_entry_price: avgPrice
+      });
 
       // NOTE: we used to place a SELL here at the first level above current price
       // "to close the gap". That was a duplicate — the main loop in placeInitialOrders
@@ -2396,6 +3141,64 @@ export class GridBotInstance {
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ [DEBUG] Error en compra inicial para bot ${this.bot.id}:`);
       throw error;
+    }
+  }
+
+  /**
+   * Limpieza tras una compra inicial CORTA o no verificable: cancela el IOC
+   * (defensivo — un IOC no debería quedar resting, pero lo intentamos por si
+   * acaso) y flatea cualquier long parcial que SÍ haya entrado, para no dejar
+   * exposición colgada cuando abortamos el bootstrap. Best-effort y ruidoso:
+   * el llamador hace throw igualmente, así que aquí NUNCA tragamos el error de
+   * cierre — solo lo logueamos para que el operador intervenga si el flateo
+   * falla. El sell de flateo va reduce_only (solo reduce el long recién comprado).
+   */
+  private async flattenInitialPurchase(iocOrderId: string, partialLong: number): Promise<void> {
+    // 1) Cancelar el IOC por si quedó algo resting. cancelOrder() devuelve
+    //    boolean y no lanza, así que es seguro llamarlo aquí.
+    if (iocOrderId && iocOrderId !== '0x00') {
+      try {
+        await this.grvt.cancelOrder(iocOrderId, this.bot.pair);
+      } catch (e) {
+        log.warn(`⚠️ Bot ${this.bot.id}: cancelar IOC inicial ${iocOrderId} falló: ${(e as Error).message}`);
+      }
+    }
+
+    // 2) Flatear el long parcial si supera el dust del instrumento.
+    const { min_size: minSize } = getInstrumentSpec(this.bot.pair);
+    const dustEpsilon = minSize * CLOSE_DUST_MIN_SIZE_FACTOR;
+    if (partialLong <= dustEpsilon) {
+      log.info(`✅ Bot ${this.bot.id}: sin long parcial relevante que flatear (${partialLong} <= dust ${dustEpsilon}).`);
+      return;
+    }
+
+    try {
+      const flatSize = Math.floor(partialLong * 100) / 100; // redondeo a min_size
+      if (flatSize < minSize) {
+        log.warn(`⚠️ Bot ${this.bot.id}: long parcial ${partialLong} redondea por debajo de min_size ${minSize}; no se puede flatear vía orden. Revisar manualmente.`);
+        return;
+      }
+      // Precio agresivo por debajo del mark para asegurar el fill del flateo.
+      const ticker = await this.grvt.getTicker(this.bot.pair);
+      const px = parseFloat(ticker.last_price);
+      const flatPrice = Math.floor(px * (1 - CLOSE_PRICE_AGGRESSION_PCT) * 100) / 100;
+
+      log.warn(`🔄 Bot ${this.bot.id}: flateando long parcial de compra inicial: SELL ${flatSize} ${this.bot.pair} @ $${flatPrice} (IOC, reduce_only)`);
+      await this.grvt.createOrder({
+        sub_account_id: this.grvt.subAccountId,
+        instrument: this.bot.pair,
+        size: flatSize.toString(),
+        price: flatPrice.toString(),
+        side: 'sell',
+        type: 'limit',
+        time_in_force: 'ioc',
+        reduce_only: true, // solo reduce el long recién comprado; nunca abre short
+        metadata: `flatten_initial_${this.bot.id}`,
+      }, true); // allowMarket=true (IOC)
+    } catch (e) {
+      // NO tragamos: el llamador hace throw igual. Solo logueamos ruidoso para
+      // que el operador sepa que quedó un long colgado a flatear a mano.
+      log.error(`🚨 Bot ${this.bot.id}: FALLÓ el flateo del long parcial (${partialLong} ${this.bot.pair}): ${(e as Error).message}. EXPOSICIÓN RESIDUAL — revisar manualmente.`);
     }
   }
 
@@ -2509,9 +3312,15 @@ export class GridBotInstance {
         activated++;
         log.info(`💫 Activated ${correctSide} @ $${r.level.price} (dist=$${r.dist.toFixed(2)})`);
       } catch (e) {
-        log.warn({ err: (e as Error).message }, `activate fail @ $${r.level.price}`);
-        // Roll back to virtual so next tick retries cleanly
+        // FRENO DE CROSS-MARGIN (DINERO REAL): si el freno disparó al activar un
+        // nivel, NO lo traguemos — re-lanzamos para que monitorAllBots pause el
+        // bot (igual que SAFEGUARD). Roll back a virtual primero para no dejar el
+        // nivel en estado inconsistente.
         await db.updateGridLevel(r.level.id, { state: 'virtual', order_id: null });
+        if (e instanceof Error && e.message.includes('MARGIN:')) {
+          throw e;
+        }
+        log.warn({ err: (e as Error).message }, `activate fail @ $${r.level.price}`);
       }
     }
 
@@ -2584,7 +3393,27 @@ export class GridBotInstance {
 
       // 💰 MODO REAL: Colocar orden en GRVT usando nuevo formato
       log.info(`💰 [DEBUG] REAL MODE - Enviando orden a GRVT con nuevo createOrder...`);
-      
+
+      // SAFEGUARD anti naked-short: en un grid LONG, un SELL es SIEMPRE toma de
+      // ganancia (reduce el long); jamás debe abrir/aumentar un short. Lo
+      // marcamos reduce_only para que GRVT lo garantice por construcción, sin
+      // importar el camino (bootstrap, counter-order, rotación, monitor). En un
+      // grid SHORT el SELL es el lado que ABRE posición, así que NO lleva
+      // reduce_only.
+      const reduceOnly =
+        GRID_SELL_REDUCE_ONLY_ENABLED &&
+        this.bot.direction === 'long' &&
+        level.side === 'sell';
+
+      // FRENO DE CROSS-MARGIN (DINERO REAL): antes de comprometer margen nuevo,
+      // proyectamos headroom + tope de notional. Ambos solo frenan órdenes que
+      // ABREN exposición (los SELL reduce_only que liberan margen pasan libres).
+      // Lanzan 'MARGIN:pause' que monitorAllBots rutea al pause path. Para que el
+      // error escale, NO debe ser tragado por el catch de abajo (ver el guard de
+      // 'MARGIN:' allí).
+      this.assertMaxNotional(level.side, level.quantity, level.price, reduceOnly);
+      await this.assertMarginHeadroom(level.side, level.quantity, level.price, reduceOnly);
+
       const order = await this.grvt.createOrder({
         sub_account_id: this.grvt.subAccountId,
         instrument: this.bot.pair,
@@ -2594,6 +3423,7 @@ export class GridBotInstance {
         type: 'limit',
         time_in_force: 'gtc',
         post_only: true,
+        reduce_only: reduceOnly,
         metadata: `grid_${this.bot.id}_${level.level_index}`
       });
 
@@ -2652,20 +3482,45 @@ export class GridBotInstance {
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ [DEBUG] Error colocando orden en nivel ${level.level_index}:`);
       log.error({ stack: error instanceof Error ? error.stack : String(error) }, 'Error stack');
-      
+
+      // FRENO DE CROSS-MARGIN (DINERO REAL): nuestro propio 'MARGIN:pause'
+      // (headroom / max_notional) debe ESCALAR a monitorAllBots para pausar el
+      // bot, NO ser tragado aquí. Lo re-lanzamos antes que cualquier otro
+      // handler "no fatal".
+      if (error instanceof Error && error.message.includes('MARGIN:')) {
+        throw error;
+      }
+
+      // FRENO DE CROSS-MARGIN: GRVT rechazó por margen insuficiente. NO
+      // reintentar — seguir colocando sobre una cuenta exhausta arma medio grid
+      // y arriesga liquidación. Convertimos el rechazo en un 'MARGIN:pause'
+      // estructurado que monitorAllBots rutea al pause path (igual patrón que
+      // 'SAFEGUARD:pause_close'). ⚠️ La signature NO está confirmada contra un
+      // rechazo real de GRVT (ver INSUFFICIENT_MARGIN_RE).
+      if (
+        MARGIN_BRAKE_ENABLED &&
+        error instanceof Error &&
+        INSUFFICIENT_MARGIN_RE.test(error.message)
+      ) {
+        log.error(`🚨 Bot ${this.bot.id}: GRVT rechazó por MARGEN INSUFICIENTE en nivel ${level.level_index} — pausando bot (no reintentar). Rechazo: ${error.message}`);
+        throw new Error(
+          `MARGIN:pause:bot=${this.bot.id}:grvt_reject — GRVT rechazó por margen insuficiente: ${error.message}`
+        );
+      }
+
       // ⚠️ NUEVO: Capturar error 7201 específicamente
       if (error instanceof Error && error.message.includes('7201')) {
         log.info(`⏸️ Nivel ${level.level_index} ($${level.price}) fuera del price band — pendiente hasta que el precio se acerque`);
         await db.markLevelPendingReplace(level.id);
         return; // NO reintentar, NO propagar como error fatal
       }
-      
+
       // Si el error es min_notional, no propagarlo como error fatal
       if (error instanceof Error && error.message.includes('min_notional')) {
         log.info(`⚠️ [DEBUG] Min_notional error - skipping nivel ${level.level_index}`);
         return;
       }
-      
+
       throw error;
     }
   }
@@ -2884,6 +3739,11 @@ export class GridBotInstance {
           await this.placeGridOrder(uc.level);
           log.info(`✅ Placed: ${correctSide} @ $${uc.level.price}`);
         } catch (e) {
+          // FRENO DE CROSS-MARGIN (DINERO REAL): re-lanzar para que monitorAllBots
+          // pause el bot en vez de seguir re-colocando sobre cuenta exhausta.
+          if (e instanceof Error && e.message.includes('MARGIN:')) {
+            throw e;
+          }
           log.info(`❌ Failed: $${uc.level.price}: ${e instanceof Error ? e.message : e}`);
         }
       }
@@ -3020,12 +3880,18 @@ export class GridBotInstance {
           state: 'active',
         });
       } catch (err: any) {
+        // FRENO DE CROSS-MARGIN (DINERO REAL): el freno debe escalar a
+        // monitorAllBots (pause); NO seguir armando counter-orders sobre una
+        // cuenta exhausta.
+        if (err instanceof Error && err.message?.includes('MARGIN:')) {
+          throw err;
+        }
         if (err.message?.includes('7201') || err.message?.includes('2090')) {
           log.info(`⚠️ Skipping level ${counterLevelIndex}: ${err.message}`);
           await db.updateGridLevel(counterLevel.id, { pending_replace: true });
         }
       }
-      
+
       await new Promise(r => setTimeout(r, 200)); // throttle
     }
     
@@ -3125,7 +3991,23 @@ export class GridBotInstance {
         return; // Success
       } catch (error) {
         const msg = error instanceof Error ? error.message : '';
-        
+
+        // FRENO DE CROSS-MARGIN (DINERO REAL): NO reintentar ante margen
+        // insuficiente. placeGridOrder ya convierte el rechazo de GRVT en un
+        // 'MARGIN:pause' estructurado; re-lanzamos para que monitorAllBots
+        // pause el bot (igual ruteo que 'SAFEGUARD:pause_close'). Matcheamos
+        // también la signature cruda por si el rechazo escapa por otro camino.
+        // ⚠️ Signature de GRVT NO confirmada (ver INSUFFICIENT_MARGIN_RE).
+        if (msg.includes('MARGIN:')) {
+          throw error;
+        }
+        if (MARGIN_BRAKE_ENABLED && INSUFFICIENT_MARGIN_RE.test(msg)) {
+          log.error(`🚨 Bot ${this.bot.id}: GRVT rechazó counter-order por MARGEN INSUFICIENTE — pausando bot (no reintentar). Rechazo: ${msg}`);
+          throw new Error(
+            `MARGIN:pause:bot=${this.bot.id}:grvt_reject — GRVT rechazó counter-order por margen insuficiente: ${msg}`
+          );
+        }
+
         // ⚠️ NUEVO: Manejo específico para error 7201 (price protection band)
         if (msg.includes('7201')) {
           log.info(`⏸️ Error 7201 (price protection band) - NO reintentar, marcar como pendiente`);
@@ -3261,6 +4143,11 @@ export class GridBotInstance {
       
       log.info(`✅ Round-trip placed: ${counterSide} @ $${nextLevel.price}`);
     } catch (error) {
+      // FRENO DE CROSS-MARGIN (DINERO REAL): re-lanzar para que
+      // placeCounterOrderWithRetry NO reintente y monitorAllBots pause el bot.
+      if (error instanceof Error && error.message.includes('MARGIN:')) {
+        throw error;
+      }
       log.error({ err: error instanceof Error ? error.message : String(error) }, `Round-trip error @ $${nextLevel.price}`);
     }
   }
@@ -3304,6 +4191,11 @@ export class GridBotInstance {
             await new Promise(r => setTimeout(r, 300));
             
           } catch (error) {
+            // FRENO DE CROSS-MARGIN (DINERO REAL): re-lanzar para que
+            // monitorAllBots pause el bot; no seguir colocando pendientes.
+            if (error instanceof Error && error.message.includes('MARGIN:')) {
+              throw error;
+            }
             if (error instanceof Error && error.message.includes('7201')) {
               // Aún fuera del price band, mantener como pendiente
             } else if (error instanceof Error && error.message.includes('2090')) {
@@ -3316,8 +4208,13 @@ export class GridBotInstance {
         }
         // Si no está dentro del rango, skip silenciosamente (sin log spam)
       }
-      
+
     } catch (error) {
+      // FRENO DE CROSS-MARGIN (DINERO REAL): el freno debe escalar a
+      // monitorAllBots (pause), no quedar tragado en este try externo.
+      if (error instanceof Error && error.message.includes('MARGIN:')) {
+        throw error;
+      }
       log.error({ err: (error as Error).message }, `❌ Error verificando niveles pendientes:`);
     }
   }
@@ -3360,7 +4257,22 @@ export class GridBotInstance {
         }
       }
 
-      const totalPnl = this.bot.grid_profit_usdt + trendPnl;
+      // ⚠️ DINERO REAL: funding NETO atribuible al bot, CON SIGNO (negativo =
+      // pagado neto, positivo = recibido neto), en USDT. Antes total_pnl_usdt
+      // NUNCA restaba funding (el gap ~$7.60). Ahora total_pnl = grid + trend +
+      // net_funding, así que el equity guardado (investment + total_pnl) refleja
+      // el PnL económico REAL del bot. Fail-safe: si no hay snapshot todavía,
+      // getNetFundingForBot devuelve 0 (no empeora el número).
+      const netFunding = await db.getNetFundingForBot(this.bot.id);
+
+      // ⚠️ SL/TP BASIS — INTENCIONAL: totalPnl ahora INCLUYE funding, por lo que
+      // el stop-loss / take-profit disparan sobre el PnL económico REAL del bot
+      // (lo que de verdad está en riesgo), no sobre un PnL inflado que ignora el
+      // costo de funding. Esto MUEVE levemente los umbrales: un funding pagado
+      // empuja el bot hacia el SL antes (correcto: estás perdiendo más) y aleja
+      // el TP. Es el comportamiento deseado en un PERP donde el funding es un
+      // costo/ingreso real continuo.
+      const totalPnl = this.bot.grid_profit_usdt + trendPnl + netFunding;
 
       await db.updateBot(this.bot.id, {
         grid_profit_usdt: this.bot.grid_profit_usdt,
@@ -3569,12 +4481,21 @@ export class GridBotInstance {
             return;
           }
           
-          // Bot equity = investment + total PnL (not account-wide balance)
+          // Bot equity = investment + total PnL (not account-wide balance).
+          // ⚠️ DINERO REAL: total_pnl_usdt ahora YA incluye el funding NETO con
+          // signo (lo escribe updatePnL: grid + trend + net_funding), así que
+          // este equity es funding-aware sin restar funding por separado acá.
+          // ⚠️ BACKFILL FUERA DE ALCANCE: los daily_snapshots YA EXISTENTES
+          // (creados antes de este fix) están desfasados por el funding
+          // acumulado — su columna equity/total_pnl NUNCA restó funding. NO se
+          // corrigen retroactivamente en este cambio; solo los snapshots NUEVOS
+          // quedan correctos. Un backfill histórico requeriría reconstruir el
+          // cumulative de funding por fecha, que GRVT no expone como serie.
           const freshBot = await db.getBot(botId);
           const botInvestment = freshBot?.investment_usdt ?? 0;
           const botTotalPnl = freshBot?.total_pnl_usdt ?? 0;
           const equity = botInvestment + botTotalPnl;
-          
+
           // Grid profit from paired_roundtrips (single source of truth)
           const gross = await db.sumPairedRoundtripProfit(botId);
           const fees = await db.sumFeesForBot(botId);

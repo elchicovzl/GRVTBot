@@ -467,6 +467,54 @@ export class GridBotDB {
       )
     `);
 
+    // Tabla: funding_snapshots (DINERO REAL)
+    // GRVT expone `cumulative_realized_funding_payment` como un TOTAL ACUMULADO
+    // por (bot, instrumento), NO como eventos discretos. El código viejo lo
+    // insertaba como una fila FRESCA cada poll en funding_history → cada poll
+    // multiplicaba el acumulado (multi-conteo). Acá guardamos UNA fila por
+    // (bot, instrumento): el cumulative MÁS RECIENTE + el cumulative en el primer
+    // avistamiento (baseline). El funding NETO atribuible al bot es
+    // carried_net + (latest_cumulative - baseline_cumulative), con SIGNO
+    // preservado (negativo = pagado, positivo = recibido).
+    //
+    // ⚠️ RE-BASELINE en close/reopen (DINERO REAL): el cumulative de GRVT vive
+    // atado a la POSICIÓN. Si la posición se cierra del todo y se reabre, GRVT
+    // puede RESETEAR el cumulative → el nuevo latest cae POR DEBAJO del baseline
+    // fijo → (latest - baseline) se vuelve negativo-por-reset (falso). Para
+    // mantener el net TOTAL correcto a través de un close/reopen NO basta con
+    // pisar baseline = latest (eso PERDERÍA el funding del epoch anterior). En
+    // cambio, cuando detectamos un reset (latest < baseline) PLEGAMOS el net del
+    // epoch que termina (latest_viejo - baseline) dentro de `carried_net` y
+    // re-baselineamos baseline = latest (nuevo epoch). Así el net acumulado
+    // queda monótono y nunca cae por un reset de GRVT. Ver upsertFundingSnapshot.
+    //
+    // ⚠️ ATRIBUCIÓN: este modelo asume UN solo bot por (sub-cuenta, instrumento).
+    // El cumulative de GRVT es account-wide por posición; si dos bots compartieran
+    // la misma posición en el mismo instrumento sobre la misma sub-cuenta, el
+    // funding se atribuiría mal. En v0 cada instrumento corre como máximo UN bot
+    // por sub-cuenta, así que el snapshot por (bot, instrumento) es 1:1 con la
+    // posición que genera el funding.
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS funding_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id INTEGER NOT NULL REFERENCES grid_bots(id) ON DELETE CASCADE,
+        instrument TEXT NOT NULL,
+        baseline_cumulative REAL NOT NULL,
+        latest_cumulative REAL NOT NULL,
+        carried_net REAL NOT NULL DEFAULT 0,
+        latest_funding_time DATETIME NOT NULL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(bot_id, instrument)
+      )
+    `);
+
+    // Migration: add carried_net to legacy funding_snapshots installs. Acumula
+    // el net de epochs cerrados por reset/reopen de GRVT (ver nota arriba).
+    try {
+      await this.dbRun(`ALTER TABLE funding_snapshots ADD COLUMN carried_net REAL NOT NULL DEFAULT 0`);
+    } catch (e) { /* ya existe */ }
+
     await this.dbRun(`
       CREATE TABLE IF NOT EXISTS daily_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -597,6 +645,7 @@ export class GridBotDB {
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_funding_bot_id ON funding_history(bot_id)`);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_funding_snap_bot_id ON funding_snapshots(bot_id)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_paired_roundtrips_bot ON paired_roundtrips(bot_id)`);
 
     // ─── Multi-tenancy migration ────────────────────────────────────
@@ -1293,9 +1342,103 @@ export class GridBotDB {
    */
   async getFundingHistoryByBot(botId: number): Promise<FundingRecord[]> {
     return await this.dbAll(`
-      SELECT * FROM funding_history 
-      WHERE bot_id = ? 
+      SELECT * FROM funding_history
+      WHERE bot_id = ?
       ORDER BY funding_time DESC
+    `, [botId]);
+  }
+
+  // === CRUD para funding_snapshots (DINERO REAL) ===
+  // El cumulative de GRVT es un TOTAL ACUMULADO por (bot, instrumento). Acá lo
+  // guardamos como UN snapshot por par y derivamos el NETO con signo como
+  // (latest - baseline). Ver nota en el CREATE TABLE.
+
+  /**
+   * Upsert del snapshot de funding acumulado para (bot, instrumento).
+   * En el primer avistamiento fija `baseline_cumulative` = `latestCumulative`
+   * (funding NETO atribuible al bot = 0 al arrancar), y en los polls siguientes
+   * actualiza SOLO `latest_cumulative`. `latestCumulative` viene CON SIGNO
+   * (negativo = pagado, positivo = recibido) y ya en USDT (sin /1e6).
+   *
+   * ⚠️ RE-BASELINE en close/reopen (DINERO REAL): el cumulative de GRVT está
+   * atado a la POSICIÓN. Si la posición se cierra del todo y se reabre, GRVT
+   * puede RESETEAR el cumulative → el `latestCumulative` entrante cae POR DEBAJO
+   * del `baseline_cumulative` fijo. Eso NO es funding negativo real: es un nuevo
+   * epoch. Cuando detectamos `latestCumulative < baseline_cumulative`, PLEGAMOS
+   * el net del epoch que termina (`latest_cumulative` viejo - `baseline`) dentro
+   * de `carried_net` y re-baselineamos `baseline = latestCumulative` (arranca el
+   * nuevo epoch en 0). El net total = carried_net + (latest - baseline) queda
+   * monótono y nunca cae por un reset de GRVT, preservando el funding del epoch
+   * anterior. Atómico vía el ON CONFLICT (lee la fila existente con el alias de
+   * la tabla y la fila entrante con `excluded`).
+   *
+   * Asume UN bot por (sub-cuenta, instrumento) — ver nota en el CREATE TABLE.
+   */
+  async upsertFundingSnapshot(params: {
+    bot_id: number;
+    instrument: string;
+    latestCumulative: number;
+    latest_funding_time: string;
+  }): Promise<void> {
+    await this.dbRun(`
+      INSERT INTO funding_snapshots
+        (bot_id, instrument, baseline_cumulative, latest_cumulative, carried_net, latest_funding_time, updated_at)
+      VALUES (?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(bot_id, instrument) DO UPDATE SET
+        -- Reset/reopen detectado: el latest entrante < baseline guardado → GRVT
+        -- reseteó el cumulative. Plegamos el net del epoch viejo en carried_net y
+        -- re-baselineamos al nuevo latest. Si no, mantenemos el baseline fijo.
+        carried_net = funding_snapshots.carried_net
+          + CASE WHEN excluded.latest_cumulative < funding_snapshots.baseline_cumulative
+                 THEN (funding_snapshots.latest_cumulative - funding_snapshots.baseline_cumulative)
+                 ELSE 0 END,
+        baseline_cumulative = CASE
+          WHEN excluded.latest_cumulative < funding_snapshots.baseline_cumulative
+          THEN excluded.latest_cumulative
+          ELSE funding_snapshots.baseline_cumulative END,
+        latest_cumulative = excluded.latest_cumulative,
+        latest_funding_time = excluded.latest_funding_time,
+        updated_at = CURRENT_TIMESTAMP
+    `, [
+      params.bot_id,
+      params.instrument,
+      params.latestCumulative,            // baseline en el primer insert
+      params.latestCumulative,
+      params.latest_funding_time,
+    ]);
+  }
+
+  /**
+   * Funding NETO atribuible a un bot, CON SIGNO (negativo = pagado neto,
+   * positivo = recibido neto), en USDT. Suma carried_net + (latest - baseline)
+   * sobre todos los instrumentos del bot. `carried_net` acumula el funding de
+   * epochs ya cerrados por reset/reopen de GRVT (ver upsertFundingSnapshot), así
+   * que el net total se mantiene correcto a través de un close/reopen. Devuelve
+   * 0 si no hay snapshot todavía.
+   */
+  async getNetFundingForBot(botId: number): Promise<number> {
+    const row = await this.dbGet(`
+      SELECT COALESCE(SUM(carried_net + (latest_cumulative - baseline_cumulative)), 0) AS net
+      FROM funding_snapshots
+      WHERE bot_id = ?
+    `, [botId]);
+    return row?.net ?? 0;
+  }
+
+  /**
+   * Snapshots de funding por (bot, instrumento) con el NET por fila ya derivado
+   * (carried_net + latest - baseline, CON SIGNO, en USDT). Reemplaza la lectura
+   * del viejo funding_history en el endpoint de funding del dashboard, que el
+   * engine ya NO escribe. Ver nota en upsertFundingSnapshot / getNetFundingForBot.
+   */
+  async getFundingSnapshotsByBot(botId: number): Promise<any[]> {
+    return await this.dbAll(`
+      SELECT id, instrument, baseline_cumulative, latest_cumulative, carried_net,
+             (carried_net + (latest_cumulative - baseline_cumulative)) AS net_usdt,
+             latest_funding_time, updated_at, created_at
+      FROM funding_snapshots
+      WHERE bot_id = ?
+      ORDER BY instrument ASC
     `, [botId]);
   }
 

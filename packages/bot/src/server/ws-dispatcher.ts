@@ -8,7 +8,8 @@
 //
 // 1. **Engine event passthrough.** The GridEngine emits a handful of events
 //    (`botCreated`, `botStarted`, `botPaused`, `botClosed`,
-//    `safeguardTriggered`). For each, we publish a corresponding bus message.
+//    `botCloseFailed`, `safeguardTriggered`). For each, we publish a
+//    corresponding bus message.
 //
 // 2. **Periodic state polling.** Every 1s we read the bot rows from the DB
 //    and publish a `bot:N:tick` snapshot for any bot that's `running`. The
@@ -126,6 +127,24 @@ export class WsDispatcher {
 
     this.engine.on('botClosed', (payload: { botId: number }) => {
       wsBus.publishToMany([`bot:${payload.botId}`, 'bots', 'notifications'], 'botClosed', payload);
+    });
+
+    // Cierre que NO logró flatear la posición dentro del límite (fail-closed):
+    // el bot quedó en 'paused' con posición residual y la orden de cierre GTC
+    // sigue viva. Alerta para que el operador intervenga manualmente.
+    this.engine.on('botCloseFailed', (payload: {
+      botId: number;
+      residualSize: number;
+      pair: string;
+      closeOrderId: string | null;
+      reason: string;
+    }) => {
+      log.error({ ...payload }, 'bot close failed — position not flat');
+      wsBus.publishToMany(
+        [`bot:${payload.botId}`, 'bots', 'notifications'],
+        'botCloseFailed',
+        payload
+      );
     });
 
     this.engine.on('safeguardTriggered', (payload: { botId: number; error: string }) => {

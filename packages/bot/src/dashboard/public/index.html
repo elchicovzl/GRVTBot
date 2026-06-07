@@ -2007,32 +2007,40 @@
 
             try {
                 const response = await fetch(`/api/bots/${botId}/funding`);
-                const funding = await response.json();
+                // Modelo nuevo: { funding: [snapshots], netFundingUsdt }. Antes era
+                // un array crudo de funding_history (congelado/corrupto). El NET
+                // autoritativo coincide ahora con el PnL del dashboard.
+                const payload = await response.json();
+                const funding = Array.isArray(payload) ? payload : (payload.funding ?? []);
+                const netFundingUsdt = Number(payload.netFundingUsdt ?? 0);
 
                 if (funding.length === 0) {
-                    container.innerHTML = '<div>No hay pagos de funding</div>';
+                    container.innerHTML = '<div>No hay funding registrado todavía</div>';
                     return;
                 }
 
+                const netClass = netFundingUsdt >= 0 ? 'stat-positive' : 'stat-negative';
                 container.innerHTML = `
+                    <div style="margin-bottom: 12px;">
+                        Funding NETO total:
+                        <span class="${netClass}">$${netFundingUsdt.toFixed(4)}</span>
+                    </div>
                     <table class="table">
                         <thead>
                             <tr>
                                 <th>Instrumento</th>
-                                <th>Rate</th>
-                                <th>Payment</th>
-                                <th>Posición</th>
-                                <th>Fecha</th>
+                                <th>NET acumulado</th>
+                                <th>Último cumulative</th>
+                                <th>Actualizado</th>
                             </tr>
                         </thead>
                         <tbody>
-                            ${funding.map(payment => `
+                            ${funding.map(snap => `
                                 <tr>
-                                    <td>${payment.instrument}</td>
-                                    <td>${(payment.funding_rate * 100).toFixed(4)}%</td>
-                                    <td class="${payment.payment_usdt >= 0 ? 'stat-positive' : 'stat-negative'}">$${payment.payment_usdt.toFixed(4)}</td>
-                                    <td>${payment.position_size}</td>
-                                    <td>${new Date(payment.funding_time).toLocaleString()}</td>
+                                    <td>${snap.instrument}</td>
+                                    <td class="${snap.net_usdt >= 0 ? 'stat-positive' : 'stat-negative'}">$${Number(snap.net_usdt).toFixed(4)}</td>
+                                    <td>$${Number(snap.latest_cumulative).toFixed(4)}</td>
+                                    <td>${new Date(snap.latest_funding_time).toLocaleString()}</td>
                                 </tr>
                             `).join('')}
                         </tbody>

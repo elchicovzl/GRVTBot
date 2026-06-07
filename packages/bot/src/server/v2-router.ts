@@ -682,6 +682,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
     for (const b of bots) {
       const labels = `bot_id="${b.id}",pair="${b.pair}"`;
+      // ⚠️ DINERO REAL: total_pnl_usdt ahora YA incluye el funding NETO con signo
+      // (lo escribe updatePnL: grid + trend + net_funding), así que este equity
+      // es funding-aware sin restar funding aparte. Solo se refresca para bots
+      // running en cada tick del engine (igual que antes).
       const equity = b.investment_usdt + b.total_pnl_usdt;
       lines.push(`grvt_bot_equity_usdt{${labels}} ${equity.toFixed(2)}`);
       lines.push(`grvt_bot_realized_usdt{${labels}} ${b.grid_profit_usdt.toFixed(2)}`);
@@ -1672,32 +1676,42 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   }));
 
   // ── GET /api/v2/bots/:id/funding ──────────────────────────────────
+  // ⚠️ DINERO REAL: lee funding_snapshots (NO el viejo funding_history). El
+  // engine ya NO escribe funding_history; escribe un snapshot acumulado por
+  // (bot, instrumento). El funding_history quedó congelado con filas viejas
+  // corruptas (÷1e6 ≈ $0, multi-contadas, Math.abs'd) que divergían del NET
+  // corregido que muestran portfolio-summary y el PnL del dashboard. El total
+  // autoritativo es net = SUM(carried_net + (latest_cumulative -
+  // baseline_cumulative)) — la MISMA fórmula que db.getNetFundingForBot.
   router.get('/bots/:id/funding', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
     await requireBotOwnership(db, id, req.userId!);
-    const limit = Math.min(parseInt(String(req.query.limit ?? '500'), 10) || 500, 5000);
-    const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
 
-    const funding = await dbAll(db, `
-      SELECT id, instrument, funding_rate, payment_usdt, position_size,
-             funding_time, created_at
-      FROM funding_history
+    // Filas de snapshot por (bot, instrumento). El NET por fila incluye
+    // carried_net (epochs cerrados por reset/reopen de GRVT) + el epoch actual.
+    const snapshots = await dbAll(db, `
+      SELECT id, instrument, baseline_cumulative, latest_cumulative, carried_net,
+             (carried_net + (latest_cumulative - baseline_cumulative)) AS net_usdt,
+             latest_funding_time, updated_at, created_at
+      FROM funding_snapshots
       WHERE bot_id = ?
-      ORDER BY funding_time DESC
-      LIMIT ? OFFSET ?
-    `, [id, limit, offset]);
+      ORDER BY instrument ASC
+    `, [id]);
 
-    const totals = await dbGet<{ count: number; total: number }>(db, `
-      SELECT COUNT(*) as count, COALESCE(SUM(payment_usdt), 0) as total
-      FROM funding_history
+    const totals = await dbGet<{ count: number; net: number }>(db, `
+      SELECT COUNT(*) as count,
+             COALESCE(SUM(carried_net + (latest_cumulative - baseline_cumulative)), 0) as net
+      FROM funding_snapshots
       WHERE bot_id = ?
     `, [id]);
 
     res.json({
-      funding,
+      // Snapshots autoritativos por instrumento (modelo nuevo).
+      funding: snapshots,
       count: totals?.count ?? 0,
-      totalPaymentUsdt: totals?.total ?? 0,
+      // Total NETO con signo (negativo = pagado neto, positivo = recibido neto).
+      netFundingUsdt: totals?.net ?? 0,
     });
     return;
   }));
@@ -2088,11 +2102,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   }));
 
   // ── POST /api/v2/bots/:id/close ───────────────────────────────────
-  // FULL stop. Cancels every open order on GRVT, then market-closes the
-  // remaining position with a 0.5% aggressive GTC limit (so it crosses
-  // the book and fills immediately). Bot status flips to 'stopped' —
-  // it stays in the DB for history but no longer counts as an active
-  // bot in the overview. Use this when you're done with a bot.
+  // FULL stop. Cancels every open order on GRVT, then closes the remaining
+  // position with an aggressive GTC limit and VERIFIES the position actually
+  // flattened (poll + bounded cancel/replace) before flipping status to
+  // 'stopped'. If it cannot flatten within the bound, closeBot() throws and
+  // leaves the bot fail-closed ('paused', position still recorded, close
+  // order still live) — we surface that as a 500 below instead of claiming
+  // success. We return the bot's ACTUAL post-close status from the DB rather
+  // than hardcoding 'stopped', so the caller never sees a false 'stopped'.
   //
   // Differs from /pause: pause only cancels orders and leaves the
   // position open so you can later /start and resume. /close is final.
@@ -2104,7 +2121,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       await engineOps.closeBot(id);
       log.info({ botId: id }, 'bot closed via API');
       cache.invalidatePrefix('bots');
-      res.json({ id, status: 'stopped' });
+      const closedBot = await dbGet<{ status: string }>(
+        db, `SELECT status FROM grid_bots WHERE id = ?`, [id]
+      );
+      res.json({ id, status: closedBot?.status ?? 'stopped' });
     } catch (err) {
       log.error({ botId: id, err: (err as Error).message }, 'bot close failed');
       res.status(500).json({
@@ -2431,22 +2451,45 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       WHERE COALESCE(user_id, 1) = ? AND status != 'stopped'
     `, [userId]);
 
+    // ⚠️ DINERO REAL: funding NETO con signo por bot (negativo = pagado neto,
+    // positivo = recibido neto), en USDT, desde funding_snapshots. Antes el
+    // equity/PnL de este endpoint NUNCA restaba funding (el gap ~$7.60).
+    // Lo sumamos por-bot (NO reconciliamos contra account_summary.total_equity
+    // acá porque este endpoint hace un DESGLOSE por bot: varios bots pueden
+    // compartir sub-cuenta y total_equity no se puede atribuir por bot sin
+    // mis-atribuir). Si no hay snapshot todavía, el NET es 0 (no empeora).
+    // carried_net acumula el funding de epochs cerrados por reset/reopen de GRVT
+    // (cuando la posición se cierra y reabre, GRVT resetea el cumulative). Se
+    // suma igual que en db.getNetFundingForBot para mantener el net correcto a
+    // través de un close/reopen — sin él, un reset volvería el net negativo-falso.
+    const fundingRows = await dbAll<{ bot_id: number; net: number }>(db, `
+      SELECT bot_id, COALESCE(SUM(carried_net + (latest_cumulative - baseline_cumulative)), 0) AS net
+      FROM funding_snapshots
+      WHERE bot_id IN (SELECT id FROM grid_bots WHERE COALESCE(user_id, 1) = ? AND status != 'stopped')
+      GROUP BY bot_id
+    `, [userId]);
+    const netFundingByBot = new Map<number, number>();
+    for (const r of fundingRows) netFundingByBot.set(r.bot_id, r.net);
+
     let totalInvested = 0;
     let totalEquity = 0;
     let totalRealized = 0;
     let totalUnrealized = 0;
+    let totalFunding = 0;
     let totalPositionUsdt = 0;
     let weightedLeverage = 0;
     const pairExposure: Record<string, number> = {};
 
     for (const b of bots) {
-      const botPnl = b.grid_profit_usdt + b.trend_pnl_usdt;
+      const netFunding = netFundingByBot.get(b.id) ?? 0;
+      const botPnl = b.grid_profit_usdt + b.trend_pnl_usdt + netFunding;
       const equity = b.investment_usdt + botPnl;
       const positionUsdt = b.position_size * b.avg_entry_price;
       totalInvested += b.investment_usdt;
       totalEquity += equity;
       totalRealized += b.grid_profit_usdt;
       totalUnrealized += b.trend_pnl_usdt;
+      totalFunding += netFunding;
       totalPositionUsdt += positionUsdt;
       weightedLeverage += b.leverage * b.investment_usdt;
       pairExposure[b.pair] = (pairExposure[b.pair] ?? 0) + positionUsdt;
@@ -2461,8 +2504,9 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       totalEquity: round(totalEquity, 2),
       totalRealized: round(totalRealized, 2),
       totalUnrealized: round(totalUnrealized, 2),
-      totalPnl: round(totalRealized + totalUnrealized, 2),
-      totalPnlPct: totalInvested > 0 ? round(((totalRealized + totalUnrealized) / totalInvested) * 100, 2) : 0,
+      totalFunding: round(totalFunding, 2),
+      totalPnl: round(totalRealized + totalUnrealized + totalFunding, 2),
+      totalPnlPct: totalInvested > 0 ? round(((totalRealized + totalUnrealized + totalFunding) / totalInvested) * 100, 2) : 0,
       totalPositionUsdt: round(totalPositionUsdt, 2),
       avgLeverage: round(avgLeverage, 1),
       pairExposure,
