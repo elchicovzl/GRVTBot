@@ -221,17 +221,29 @@ describe('ws-dispatcher alert persistence (G.4)', () => {
       closeOrderId: null,
       reason: 'close order not filled in time',
     });
+    // F2.2: backfill reconciliation found live position ≠ grid-implied.
+    engine.emit('positionDrift', {
+      botId: 5,
+      pair: 'ETH_USDT_Perp',
+      liveSize: 0.1,
+      expectedSize: 0.25,
+      drift: 0.15,
+      tolerance: 0.025,
+    });
 
     // persistAlert resolves the owner via an async db.get — give it a beat.
     await new Promise((r) => setTimeout(r, 100));
     dispatcher.stop();
 
     const alerts = await db.getAlertsForUser(u2, 50);
-    expect(alerts).toHaveLength(3);
+    expect(alerts).toHaveLength(4);
     const types = alerts.map((a) => a.type).sort();
-    expect(types).toEqual(['close_failed', 'margin_pause', 'safeguard']);
+    expect(types).toEqual(['close_failed', 'margin_pause', 'position_drift', 'safeguard']);
     expect(alerts.every((a) => a.bot_id === 5)).toBe(true);
     expect(alerts.every((a) => a.severity === 'critical')).toBe(true);
+    const driftAlert = alerts.find((a) => a.type === 'position_drift')!;
+    expect(driftAlert.message).toContain('live 0.1');
+    expect(driftAlert.message).toContain('Not auto-corrected');
 
     // Nothing leaked to user 1.
     expect(await db.getAlertsForUser(1, 50)).toHaveLength(0);
