@@ -61,11 +61,25 @@ interface PairedRoundtripRow {
   created_at: string;
 }
 
+// G.4: minimal surface of GridBotDB the dispatcher needs to persist
+// alerts. Typed structurally so tests can pass a tiny fake.
+export interface AlertStore {
+  recordAlert(params: {
+    user_id: number;
+    bot_id?: number | null;
+    type: string;
+    severity?: 'info' | 'warning' | 'critical';
+    message: string;
+  }): Promise<number>;
+}
+
 export interface DispatcherDeps {
   /** The GridEngine instance (or anything with .on(eventName, fn) — we type loosely to avoid pulling the giant grid-engine types in here). */
   engine: EventEmitter;
   /** A sqlite3 Database that has both `grid_bots` and `paired_roundtrips` tables. */
   db: Database.Database;
+  /** G.4: optional persistent alert sink. When provided, safeguard/margin pauses and failed closes are written to the `alerts` table. */
+  alertStore?: AlertStore;
   /** Polling interval for the per-bot state tick. Default 1000ms. */
   tickIntervalMs?: number;
   /** Polling interval for the fill detector. Default 2000ms. */
@@ -75,6 +89,7 @@ export interface DispatcherDeps {
 export class WsDispatcher {
   private engine: EventEmitter;
   private db: Database.Database;
+  private alertStore: AlertStore | null;
   private tickIntervalMs: number;
   private fillIntervalMs: number;
 
@@ -90,8 +105,36 @@ export class WsDispatcher {
   constructor(deps: DispatcherDeps) {
     this.engine = deps.engine;
     this.db = deps.db;
+    this.alertStore = deps.alertStore ?? null;
     this.tickIntervalMs = deps.tickIntervalMs ?? 1000;
     this.fillIntervalMs = deps.fillIntervalMs ?? 2000;
+  }
+
+  // G.4: persist an alert row for the bot's owner. Fire-and-forget —
+  // alert history must never break the event path that pauses bots.
+  // Owner lookup mirrors the router's legacy policy: NULL user_id = 1.
+  private persistAlert(
+    botId: number,
+    type: string,
+    severity: 'info' | 'warning' | 'critical',
+    message: string
+  ): void {
+    const store = this.alertStore;
+    if (!store) return;
+    this.db.get(
+      `SELECT user_id FROM grid_bots WHERE id = ?`,
+      [botId],
+      (err: Error | null, row: { user_id: number | null } | undefined) => {
+        if (err) {
+          log.warn({ err: err.message, botId }, 'persistAlert: owner lookup failed');
+          return;
+        }
+        const userId = row?.user_id ?? 1;
+        store
+          .recordAlert({ user_id: userId, bot_id: botId, type, severity, message })
+          .catch((e: Error) => log.warn({ err: e.message, botId }, 'persistAlert: insert failed'));
+      }
+    );
   }
 
   start(): void {
@@ -140,6 +183,14 @@ export class WsDispatcher {
       reason: string;
     }) => {
       log.error({ ...payload }, 'bot close failed — position not flat');
+      // G.4: durable record — a non-flat close is exactly the kind of
+      // 3am event the user must be able to find later.
+      this.persistAlert(
+        payload.botId,
+        'close_failed',
+        'critical',
+        `Close failed (residual ${payload.residualSize} ${payload.pair}): ${payload.reason}`
+      );
       wsBus.publishToMany(
         [`bot:${payload.botId}`, 'bots', 'notifications'],
         'botCloseFailed',
@@ -147,8 +198,19 @@ export class WsDispatcher {
       );
     });
 
-    this.engine.on('safeguardTriggered', (payload: { botId: number; error: string }) => {
+    this.engine.on('safeguardTriggered', (payload: {
+      botId: number;
+      action?: string;
+      reason?: string;
+      error: string;
+    }) => {
       log.warn({ ...payload }, 'safeguard triggered');
+      // G.4: persist the pause. The engine reuses this event for both
+      // SAFEGUARD (liq proximity, SL/TP) and the MARGIN brake — derive
+      // the alert type from the structured reason string.
+      const reason = payload.reason ?? payload.error ?? '';
+      const type = reason.includes('MARGIN:') ? 'margin_pause' : 'safeguard';
+      this.persistAlert(payload.botId, type, 'critical', reason || 'safeguard triggered');
       wsBus.publishToMany(
         [`bot:${payload.botId}`, 'bots', 'notifications'],
         'safeguardTriggered',

@@ -1,0 +1,18 @@
+# G.3 — Daily trigger for grvt-backup.service (03:00 UTC, with up to
+# 15 min of jitter so a fleet of self-hosters doesn't hammer shared
+# storage at the same second). Persistent=true runs a missed backup on
+# the next boot if the box was down at 03:00.
+#
+# Enable: sudo systemctl enable --now grvt-backup.timer
+# Verify: systemctl list-timers grvt-backup.timer
+
+[Unit]
+Description=Daily GRVT Grid bot SQLite backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

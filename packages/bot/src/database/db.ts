@@ -152,6 +152,17 @@ export interface DailySnapshot {
   created_at: string;
 }
 
+// G.4: persistent alert history row (safeguard/margin pauses, etc.)
+export interface AlertRow {
+  id: number;
+  user_id: number;
+  bot_id: number | null;
+  type: string;
+  severity: 'info' | 'warning' | 'critical';
+  message: string;
+  created_at: number;
+}
+
 /**
  * Database Manager con SQLite + WAL mode
  */
@@ -783,6 +794,26 @@ export class GridBotDB {
     `);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_pwreset_token_hash ON password_reset_tokens(token_hash)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_pwreset_user ON password_reset_tokens(user_id)`);
+
+    // G.4: alerts — persistent history of operational events (safeguard
+    // pauses, margin brakes, failed closes). The WS `notifications`
+    // channel is ephemeral: if the user isn't connected when a bot gets
+    // paused at 3am they never learn why. This table is the durable
+    // record behind GET /api/v2/alerts. bot_id is nullable (system-level
+    // alerts) and deliberately NOT a FK so alert history survives bot
+    // deletion.
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        bot_id INTEGER,
+        type TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'warning' CHECK (severity IN ('info', 'warning', 'critical')),
+        message TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_alerts_user_created ON alerts(user_id, created_at)`);
 
     // ALTER existing tables to add user_id. Wrapped in try/catch
     // because SQLite doesn't support `ADD COLUMN IF NOT EXISTS`.
@@ -1837,6 +1868,25 @@ export class GridBotDB {
     return this.db;
   }
 
+  /** Absolute path of the SQLite file (':memory:' in tests). Used by the
+   * WAL size gauge and the checkpoint guard to stat `<path>-wal`. */
+  getDbPath(): string {
+    return this.dbPath;
+  }
+
+  /**
+   * G.5: run `PRAGMA wal_checkpoint(<mode>)`. RESTART blocks new writers
+   * briefly but guarantees the WAL is fully transferred and restarted
+   * from the beginning, so the -wal file stops growing. Returns the
+   * pragma's result row: busy=1 means a reader/writer blocked the
+   * checkpoint; log/checkpointed are WAL frame counts.
+   */
+  async walCheckpoint(
+    mode: 'PASSIVE' | 'FULL' | 'RESTART' | 'TRUNCATE' = 'RESTART'
+  ): Promise<{ busy: number; log: number; checkpointed: number } | undefined> {
+    return await this.dbGet(`PRAGMA wal_checkpoint(${mode})`);
+  }
+
   // === Utilidades ===
 
   /**
@@ -1960,6 +2010,41 @@ export class GridBotDB {
     await this.dbRun(
       `UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL`,
       [Date.now(), userId]
+    );
+  }
+
+  // ─── G.4: alerts (persistent operational events) ───────────────
+
+  async recordAlert(params: {
+    user_id: number;
+    bot_id?: number | null;
+    type: string;
+    severity?: 'info' | 'warning' | 'critical';
+    message: string;
+  }): Promise<number> {
+    const result = await this.dbRun(
+      `INSERT INTO alerts (user_id, bot_id, type, severity, message, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        params.user_id,
+        params.bot_id ?? null,
+        params.type,
+        params.severity ?? 'warning',
+        params.message,
+        Date.now(),
+      ]
+    );
+    return result.lastID ?? 0;
+  }
+
+  async getAlertsForUser(userId: number, limit = 50): Promise<AlertRow[]> {
+    return await this.dbAll(
+      `SELECT id, user_id, bot_id, type, severity, message, created_at
+       FROM alerts
+       WHERE user_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      [userId, limit]
     );
   }
 
