@@ -262,6 +262,9 @@ export interface BacktestInput {
   num_grids: number;
   investment_usdt: number;
   fee_pct?: number;          // default 0.05 (5 bps maker)
+  slippage_bps?: number;        // taker slippage, default 2 bps
+  funding_rate_per_8h?: number; // decimal, default 0.0001; 0 disables
+  active_window_size?: number;  // default 70 (GRVT 80-order cap)
   interval?: CandleInterval; // default 'CI_1_H'
   limit?: number;            // candle count, default 500, max 1000
 }
@@ -269,6 +272,12 @@ export interface BacktestInput {
 export interface BacktestResult {
   totalProfit: number;
   totalFees: number;
+  /** Net funding paid (negative = received). */
+  fundingUsdt?: number;
+  /** Slippage cost on taker executions (initial purchase). */
+  slippageUsdt?: number;
+  /** Fills skipped because the level was outside the active order window. */
+  missedFillsWindow?: number;
   netProfit: number;
   maxDrawdownPct: number;
   roundTrips: number;
