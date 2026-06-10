@@ -7,6 +7,7 @@ import { makerFeeRate, minProfitableSpacing, roundTripFeeUsdt, MIN_SPACING_SAFET
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { childLogger } from '../server/logger.js';
+import { botMetrics, classifyMonitorError } from '../server/metrics-registry.js';
 import { EventEmitter } from 'events';
 
 const log = childLogger('engine');
@@ -1578,9 +1579,14 @@ export class GridEngine extends EventEmitter {
       if (this.bumpInProgress.has(botId)) {
         continue;
       }
+      // G.5: lightweight per-bot tick timing for /metrics. The finally
+      // block records the duration whether monitor() succeeded or threw.
+      const tickStart = Date.now();
       try {
         await instance.monitor();
       } catch (error) {
+        // G.5: classified error counter (safeguard/margin/api_timeout/…)
+        botMetrics.recordError(botId, classifyMonitorError(error));
         log.error({ err: (error as Error).message }, `❌ Error monitoreando bot ${botId}:`);
 
         // Si hay errores críticos, pausar el bot (o pausar + cerrar según la acción).
@@ -1624,6 +1630,9 @@ export class GridEngine extends EventEmitter {
             error: error.message, // legacy field preserved for existing WS consumers
           });
         }
+      } finally {
+        // G.5: last-tick duration gauge + stall counter (>10s).
+        botMetrics.recordTick(botId, instance.getBot().pair, Date.now() - tickStart);
       }
     }
 

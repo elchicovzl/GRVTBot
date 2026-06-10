@@ -17,6 +17,7 @@ import type Database from 'sqlite3';
 import { createHash, randomBytes } from 'node:crypto';
 import { childLogger } from './logger.js';
 import { cache } from './cache.js';
+import { botMetrics, walSizeBytes } from './metrics-registry.js';
 import type { GridBotDB } from '../database/db.js';
 import { hashPassword, verifyPassword } from '../auth/passwords.js';
 import { signToken, verifyToken } from '../auth/jwt.js';
@@ -758,6 +759,25 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       `grvt_process_memory_heap_bytes ${process.memoryUsage().heapUsed}`,
     );
 
+    // G.5: per-bot monitor instrumentation — last tick duration, stall
+    // count, classified error counters. Written by grid-engine into the
+    // in-memory registry; read here.
+    lines.push(...botMetrics.renderPrometheus());
+
+    // G.5: SQLite WAL health. A growing -wal file means checkpoints are
+    // being starved (long readers) — alert before the disk fills up.
+    // gridBotDb is duck-typed in some tests, so guard the accessor.
+    let walBytes = 0;
+    const getDbPath = (gridBotDb as { getDbPath?: () => string }).getDbPath;
+    if (typeof getDbPath === 'function') {
+      walBytes = walSizeBytes(getDbPath.call(gridBotDb));
+    }
+    lines.push(
+      '# HELP grvt_sqlite_wal_size_bytes Size of the SQLite write-ahead log file',
+      '# TYPE grvt_sqlite_wal_size_bytes gauge',
+      `grvt_sqlite_wal_size_bytes ${walBytes}`,
+    );
+
     res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
     res.send(lines.join('\n') + '\n');
     return;
@@ -785,6 +805,18 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       createdAt: user.created_at,
       lastLoginAt: user.last_login_at,
     });
+    return;
+  }));
+
+  // ── GET /api/v2/alerts ─────────────────────────────────────────
+  // G.4: persistent alert history (safeguard/margin pauses, failed
+  // closes). Per-user scoped via req.userId — a user only ever sees
+  // their own alerts. ?limit=N caps at 200.
+  router.get('/alerts', asyncHandler(async (req, res) => {
+    const rawLimit = parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 50, 1), 200);
+    const alerts = await gridBotDb.getAlertsForUser(req.userId!, limit);
+    res.json({ alerts });
     return;
   }));
 

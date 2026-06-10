@@ -140,10 +140,13 @@ export function mountV2(opts: MountV2Options): V2Handles {
     },
   });
 
-  // Wire the engine events + DB polling to the bus
+  // Wire the engine events + DB polling to the bus.
+  // G.4: gridBotDb doubles as the persistent alert sink so safeguard /
+  // margin pauses survive in the `alerts` table beyond the WS broadcast.
   const dispatcher = new WsDispatcher({
     engine: opts.engine,
-    db: opts.db
+    db: opts.db,
+    alertStore: opts.gridBotDb
   });
   dispatcher.start();
 

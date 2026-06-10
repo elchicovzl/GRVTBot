@@ -115,15 +115,20 @@ docker kill grvt-grid-bot
 
 ## Backups
 
-The bot's SQLite database lives at `./data/grid_bot.db` on the host. WAL
-files (`*.db-wal`, `*.db-shm`) live next to it. Back the whole `data/`
-directory up nightly to somewhere off-host:
+The bot's SQLite database lives at `./data/grid_bot.db` on the host. Do
+**not** tar/cp the `data/` directory while the bot is running — in WAL
+mode that can produce a torn, unrecoverable copy. Use the WAL-safe
+backup script instead:
 
 ```bash
-# Example: cron job that pushes a daily snapshot to S3 / Backblaze / etc.
-0 3 * * * cd /opt/grvt-grid && tar czf - data | rclone rcat \
-    remote:grvt-grid-backups/$(date +\%F).tar.gz
+# Daily WAL-safe snapshot + retention (systemd units provided)
+sudo cp scripts/systemd/grvt-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now grvt-backup.timer
 ```
+
+Full details — what gets backed up, off-host upload hooks, restore steps,
+and **why `master.key` must be backed up separately off-host** — in
+[docs/BACKUPS.md](./BACKUPS.md).
 
 ## Updating
 

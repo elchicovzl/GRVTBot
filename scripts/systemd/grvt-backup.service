@@ -1,0 +1,25 @@
+# G.3 — One-shot WAL-safe SQLite backup. Triggered daily by
+# grvt-backup.timer; can also be run manually:
+#   systemctl start grvt-backup.service
+#
+# Install:
+#   sudo cp scripts/systemd/grvt-backup.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now grvt-backup.timer
+#
+# Adjust the Environment= paths to your install location.
+
+[Unit]
+Description=GRVT Grid bot SQLite backup (WAL-safe)
+Documentation=file:///opt/grvt-grid/docs/BACKUPS.md
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=GRID_BOT_DB=/opt/grvt-grid/data/grid_bot.db
+Environment=BACKUP_DIR=/var/backups/grvt-grid-bot
+Environment=BACKUP_RETAIN_DAYS=7
+ExecStart=/opt/grvt-grid/scripts/backup.sh
+# Backups are housekeeping — never compete with the trading process.
+Nice=10
+IOSchedulingClass=idle

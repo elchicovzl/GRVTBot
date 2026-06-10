@@ -19,6 +19,7 @@ import { gridEngine } from '../bot/grid-engine.js';
 import { getAuthStatus, authenticatedRequest } from '../api/auth.js';
 import { GRVT_TRADING_BASE_URL } from '../api/grvt-config.js';
 import { mountV2 } from '../server/v2-bootstrap.js';
+import { startWalCheckpointGuard } from '../database/wal-checkpoint.js';
 
 dotenv.config();
 
@@ -1438,6 +1439,12 @@ process.on('SIGTERM', async () => {
 async function startServer() {
   try {
     await initializeServices();
+
+    // G.5: WAL health — stat the -wal file every minute and force
+    // PRAGMA wal_checkpoint(RESTART) when it exceeds
+    // GRVT_WAL_CHECKPOINT_MB (default 100). The timer is unref'd so it
+    // never blocks shutdown.
+    startWalCheckpointGuard(db);
 
     // Wrap the express app in an explicit HTTP server so the v2 WebSocket
     // server can attach to the same port via the upgrade event.
