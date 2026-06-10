@@ -146,4 +146,40 @@ describe('computeRangeUpdatePlan (D.5)', () => {
     expect(p.newRange).toEqual({ lower: 1900, upper: 2300 });
     expect(p.newLevels.length).toBe(31);
   });
+
+  // F1.1 — minimum profitable spacing on range EDITS
+  describe('minimum profitable spacing (F1.1)', () => {
+    it('flags violation when the new spacing is below the round-trip fee floor', () => {
+      // 2090-2110 / 30 grids → spacing $0.67; floor at mid 2100 = $3.15
+      const p = computeRangeUpdatePlan(inputs({ newLower: 2090, newUpper: 2110 }));
+      expect(
+        p.safetyViolations.some((v) => v.includes('minimum profitable spacing'))
+      ).toBe(true);
+    });
+
+    it('does NOT flag a healthy spacing', () => {
+      // default 1900-2300 / 30 grids → spacing $13.33 >> $3.15 floor
+      const p = computeRangeUpdatePlan(inputs());
+      expect(
+        p.safetyViolations.some((v) => v.includes('minimum profitable spacing'))
+      ).toBe(false);
+    });
+
+    it('skips the check on no-op commits so legacy tight-spacing bots are not bricked', () => {
+      // Legacy bot already running at 2090-2110 (spacing below today's
+      // floor). Re-committing the SAME range is a no-op and must not be
+      // refused — only an actual edit has to meet the floor.
+      const p = computeRangeUpdatePlan(
+        inputs({
+          bot: { ...inputs().bot, lower_price: 2090, upper_price: 2110 },
+          newLower: 2090,
+          newUpper: 2110,
+        })
+      );
+      expect(p.noop).toBe(true);
+      expect(
+        p.safetyViolations.some((v) => v.includes('minimum profitable spacing'))
+      ).toBe(false);
+    });
+  });
 });

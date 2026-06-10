@@ -3,6 +3,7 @@
 
 import { grvtClient, type GRVTClient, type Balance, getInstrumentSpec } from '../api/client.js';
 import { getGrvtClientForBot, invalidateGrvtClient } from '../api/grvt-client-factory.js';
+import { makerFeeRate, minProfitableSpacing, MIN_SPACING_SAFETY_FACTOR } from './fee-model.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { childLogger } from '../server/logger.js';
@@ -206,6 +207,23 @@ export function computeRangeUpdatePlan(input: RangeUpdateInputs): RangeUpdatePla
 
   const numGrids = bot.num_grids;
   const newSpacing = (newUpper - newLower) / numGrids;
+
+  // Fee floor (same rule as validateGridConfig): refuse range EDITS
+  // whose spacing can't cover the round-trip fee with margin. Skipped
+  // for no-ops so a legacy bot with tight spacing isn't bricked by an
+  // unchanged-range commit — only an actual edit must meet the floor.
+  if (!noop && newLower < newUpper) {
+    const newMid = (newLower + newUpper) / 2;
+    const minSpacing = minProfitableSpacing(newMid);
+    if (newSpacing < minSpacing) {
+      safetyViolations.push(
+        `New spacing $${newSpacing.toFixed(2)} is below the minimum profitable spacing ` +
+        `$${minSpacing.toFixed(2)} at mid price $${newMid.toFixed(2)} — round-trip maker fees ` +
+        `(~${makerFeeRate() * 10000} bps/side, ×${MIN_SPACING_SAFETY_FACTOR} safety) would exceed ` +
+        `the per-cycle profit. Widen the range or reduce num_grids.`
+      );
+    }
+  }
 
   const newLevels: Array<{ level_index: number; price: number; side: 'buy' | 'sell'; quantity: number }> = [];
   let sellLevelsCount = 0;
@@ -1784,7 +1802,32 @@ export class GridEngine extends EventEmitter {
       throw new Error(`Con $${config.investmentUSDT} de inversión, máximo ${maxGrids} grids (mín $${minNotional} por grid para ${config.pair})`);
     }
 
-    log.info(`✅ [DEBUG] Configuración validada: ${config.numGrids} grids x $${investmentPerGrid.toFixed(2)} cada uno >= $${minNotional} min_notional`);
+    // Fee floor: per-cycle profit is spacing*qty and the round-trip fee
+    // is ~2*mid*qty*feeRate, so qty cancels — a grid whose spacing is
+    // below 2*mid*feeRate*safety loses money on EVERY cycle, regardless
+    // of order size. Enforced on CREATE only (this method is called
+    // exclusively from createBot; range edits go through
+    // computeRangeUpdatePlan which has the same check). Resume/restart
+    // of existing bots never passes through here, so legacy bots with
+    // tight spacing keep running.
+    const spacing = (config.upperPrice - config.lowerPrice) / config.numGrids;
+    const midPrice = (config.lowerPrice + config.upperPrice) / 2;
+    const minSpacing = minProfitableSpacing(midPrice);
+    if (spacing < minSpacing) {
+      const feeBps = makerFeeRate() * 10000;
+      const maxProfitableGrids = Math.floor((config.upperPrice - config.lowerPrice) / minSpacing);
+      const err = new Error(
+        `Grid spacing $${spacing.toFixed(2)} is below the minimum profitable spacing ` +
+        `$${minSpacing.toFixed(2)} at mid price $${midPrice.toFixed(2)}: each round-trip pays ` +
+        `~${feeBps} bps/side in maker fees (×${MIN_SPACING_SAFETY_FACTOR} safety margin), so this ` +
+        `grid would lose money on every cycle. Use at most ${maxProfitableGrids} grids for this ` +
+        `range, or widen the price range.`
+      ) as Error & { status?: number };
+      err.status = 400; // config error, not a server fault
+      throw err;
+    }
+
+    log.info(`✅ [DEBUG] Configuración validada: ${config.numGrids} grids x $${investmentPerGrid.toFixed(2)} cada uno >= $${minNotional} min_notional, spacing $${spacing.toFixed(2)} >= $${minSpacing.toFixed(2)} fee floor`);
   }
 
   /**
@@ -2179,9 +2222,11 @@ export class GridEngine extends EventEmitter {
     // Hard refuse on any safety violation. The dashboard preview shows
     // the same warnings so the user is never surprised at this point.
     if (plan.safetyViolations.length > 0) {
-      throw new Error(
+      const err = new Error(
         `Range update refused: ${plan.safetyViolations.join('; ')}`
-      );
+      ) as Error & { status?: number };
+      err.status = 400; // user-fixable config problem, not a server fault
+      throw err;
     }
 
     // No-op short-circuit. The plan builder already detected this and

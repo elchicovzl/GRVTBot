@@ -227,6 +227,83 @@ describe('POST /api/v2/bots — C.9 duplicate instrument guard', () => {
   });
 });
 
+describe('POST /api/v2/bots — F1.1 min profitable spacing propagation', () => {
+  it('maps engine fee-floor rejection (status=400) to HTTP 400 with the message', async () => {
+    const { app, engineOps } = createTestApp();
+    const engineErr = Object.assign(
+      new Error(
+        'Grid spacing $2.00 is below the minimum profitable spacing $3.15 at mid price $2100.00: ' +
+          'each round-trip pays ~5 bps/side in maker fees (×1.5 safety margin), so this grid would ' +
+          'lose money on every cycle.'
+      ),
+      { status: 400 }
+    );
+    engineOps.createBot.mockRejectedValue(engineErr);
+
+    const res = await request(app)
+      .post('/api/v2/bots')
+      .set('X-Api-Key', API_KEY)
+      .send({
+        pair: 'ETH_USDT_Perp',
+        direction: 'long',
+        lower_price: 2090,
+        upper_price: 2110,
+        num_grids: 10,
+        investment_usdt: 500,
+        leverage: 2,
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.message).toContain('minimum profitable spacing');
+    expect(res.body.message).toContain('fees');
+  });
+
+  it('still maps unexpected engine errors to HTTP 500', async () => {
+    const { app, engineOps } = createTestApp();
+    engineOps.createBot.mockRejectedValue(new Error('GRVT exploded'));
+
+    const res = await request(app)
+      .post('/api/v2/bots')
+      .set('X-Api-Key', API_KEY)
+      .send({
+        pair: 'ETH_USDT_Perp',
+        direction: 'long',
+        lower_price: 1800,
+        upper_price: 2400,
+        num_grids: 10,
+        investment_usdt: 500,
+        leverage: 2,
+      });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('create_failed');
+  });
+});
+
+describe('POST /api/v2/bots/:id/range — F1.1 refusal propagation', () => {
+  it('maps engine safety refusal (status=400) to HTTP 400 range_update_refused', async () => {
+    const { app, db, engineOps } = createTestApp();
+    db._addBot({ id: 5, user_id: 1, pair: 'ETH_USDT_Perp', status: 'running' });
+    const refusal = Object.assign(
+      new Error(
+        'Range update refused: New spacing $0.67 is below the minimum profitable spacing $3.15'
+      ),
+      { status: 400 }
+    );
+    engineOps.updateBotRange.mockRejectedValue(refusal);
+
+    const res = await request(app)
+      .post('/api/v2/bots/5/range')
+      .set('X-Api-Key', API_KEY)
+      .send({ lowerPrice: 2090, upperPrice: 2110 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('range_update_refused');
+    expect(res.body.message).toContain('minimum profitable spacing');
+  });
+});
+
 describe('POST /api/v2/bots — C.4 safeguard validation', () => {
   it('accepts bot with valid safeguard fields', async () => {
     const { app, engineOps } = createTestApp();
