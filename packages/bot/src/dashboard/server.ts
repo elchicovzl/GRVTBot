@@ -440,7 +440,7 @@ app.get('/api/bots/:id', async (req, res) => {
       avgEntryPrice: bot.avg_entry_price,
       liquidationPrice: bot.liquidation_price,
       createdAt: bot.created_at,
-      ...params, // spacing, quantityPerGrid, estimatedProfitPerGrid
+      ...params, // spacing, quantityPerGrid, estimatedProfitPerGrid (NET of fees since F1.2; bots created earlier carry the old gross value), estimatedProfitPerGridGross, estimatedFeePerRoundTrip
       compound_pct: (bot as any).compound_pct || 0,
       compound_threshold_usdt: (bot as any).compound_threshold_usdt || 50,
       compound_interval_hours: (bot as any).compound_interval_hours || 24,

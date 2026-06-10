@@ -81,6 +81,7 @@ vi.mock('../src/server/logger.js', () => ({
 }));
 
 import { computeLiqPriceLocal, GridEngine } from '../src/bot/grid-engine.js';
+import { makerFeeRate, roundTripFeeUsdt } from '../src/bot/fee-model.js';
 
 // ── 1. computeLiqPriceLocal ──────────────────────────────────────────
 
@@ -335,7 +336,9 @@ describe('GridEngine.calculateGridLevels', () => {
     expect(result.liquidationPrice).toBe(1200);
   });
 
-  it('estimated profit per grid = spacing * qty', async () => {
+  // F1.2: estimatedProfitPerGrid is NET of the round-trip maker fee.
+  // Gross (spacing * qty) is still exposed as estimatedProfitPerGridGross.
+  it('estimated gross profit per grid = spacing * qty', async () => {
     const result = await engine.calculateGridLevels({
       pair: 'ETH_USDT_Perp',
       direction: 'long',
@@ -346,10 +349,64 @@ describe('GridEngine.calculateGridLevels', () => {
       investmentUSDT: 500,
     });
 
-    expect(result.estimatedProfitPerGrid).toBeCloseTo(
+    expect(result.estimatedProfitPerGridGross).toBeCloseTo(
       result.spacing * result.quantityPerGrid,
-      2
+      6
     );
+  });
+
+  it('estimated profit per grid is NET: gross minus round-trip fee (F1.2)', async () => {
+    const result = await engine.calculateGridLevels({
+      pair: 'ETH_USDT_Perp',
+      direction: 'long',
+      leverage: 2,
+      lowerPrice: 1800,
+      upperPrice: 2400,
+      numGrids: 10,
+      investmentUSDT: 500,
+    });
+
+    // Representative price pair is the range midpoint: buy = mid,
+    // sell = mid + spacing (same convention as the engine).
+    const mid = (1800 + 2400) / 2;
+    const expectedFee = roundTripFeeUsdt(
+      mid,
+      mid + result.spacing,
+      result.quantityPerGrid,
+      makerFeeRate()
+    );
+
+    expect(result.estimatedFeePerRoundTrip).toBeCloseTo(expectedFee, 8);
+    expect(result.estimatedProfitPerGrid).toBeCloseTo(
+      result.estimatedProfitPerGridGross - result.estimatedFeePerRoundTrip,
+      8
+    );
+    // Net must be strictly below gross (fees are never free)…
+    expect(result.estimatedProfitPerGrid).toBeLessThan(result.estimatedProfitPerGridGross);
+    // …and still positive: F1.1 already rejects fee-unprofitable spacings.
+    expect(result.estimatedProfitPerGrid).toBeGreaterThan(0);
+  });
+
+  it('net estimate matches known fee numbers (5 bps maker default)', async () => {
+    // spacing = (2400-1800)/10 = $60; mid = 2100; qty = 0.04
+    //   (effCap = 500*2*0.75 = 750; 750/10/2100 = 0.0357 → ceil → 0.04)
+    // gross = 60 * 0.04           = 2.40
+    // fee   = (2100+2160)*0.04*0.0005 = 0.0852
+    // net   = 2.40 - 0.0852       = 2.3148
+    const result = await engine.calculateGridLevels({
+      pair: 'ETH_USDT_Perp',
+      direction: 'long',
+      leverage: 2,
+      lowerPrice: 1800,
+      upperPrice: 2400,
+      numGrids: 10,
+      investmentUSDT: 500,
+    });
+
+    expect(result.quantityPerGrid).toBeCloseTo(0.04, 8);
+    expect(result.estimatedProfitPerGridGross).toBeCloseTo(2.4, 6);
+    expect(result.estimatedFeePerRoundTrip).toBeCloseTo(0.0852, 6);
+    expect(result.estimatedProfitPerGrid).toBeCloseTo(2.3148, 6);
   });
 });
 

@@ -1891,7 +1891,8 @@
                         <div class="preview-item"><span>Inversión:</span> <span>$${bot.investment}</span></div>
                         <div class="preview-item"><span>Spacing:</span> <span>$${bot.spacing}</span></div>
                         <div class="preview-item"><span>Cantidad/Grid:</span> <span>${bot.quantityPerGrid}</span></div>
-                        <div class="preview-item"><span>Profit/Grid:</span> <span>$${bot.estimatedProfitPerGrid}</span></div>
+                        <div class="preview-item"><span>Profit/Grid${bot.estimatedFeePerRoundTrip != null ? ' (neto de fees)' : ''}:</span> <span>$${bot.estimatedProfitPerGrid}</span></div>
+                        ${bot.estimatedFeePerRoundTrip != null ? `<div class="preview-item"><span>Fees/Round-trip:</span> <span>$${Number(bot.estimatedFeePerRoundTrip).toFixed(4)}</span></div>` : ''}
                         <div class="preview-item"><span>Liq. Price:</span> <span>$${bot.liquidationPrice}</span></div>
                     </div>
 

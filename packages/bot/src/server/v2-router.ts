@@ -25,6 +25,7 @@ import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
 import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
 import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { computeQtyPerLevel } from '../bot/grid-engine.js';
+import { makerFeeRate, roundTripFeeUsdt } from '../bot/fee-model.js';
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -2020,7 +2021,13 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     // shown qty/profit ~5x for pairs absent from the spec table (e.g. BNB,
     // which falls back to min_notional 5). See grid-engine.computeQtyPerLevel.
     const qtyPerLevel = computeQtyPerLevel(investment, leverage, grids, midPrice, pair);
-    const profitPerRoundTrip = qtyPerLevel * spacing;
+    // F1.2: profit per round-trip shown to the user is NET of fees,
+    // mirroring grid-engine.calculateGridLevels. Fees vary slightly per
+    // level, so the range MIDPOINT is the representative price pair
+    // (buy = mid, sell = mid + spacing) — same convention as the engine.
+    const profitPerRoundTripGross = qtyPerLevel * spacing;
+    const feePerRoundTrip = roundTripFeeUsdt(midPrice, midPrice + spacing, qtyPerLevel, makerFeeRate());
+    const profitPerRoundTrip = profitPerRoundTripGross - feePerRoundTrip;
 
     // Estimated liquidation: simplified — actual depends on funding/fees.
     // For LONG: liq ≈ avg_entry * (1 - 1/leverage * 0.95)
@@ -2044,7 +2051,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         spacingPct: round((spacing / midPrice) * 100, 3),
         qtyPerLevel: round(qtyPerLevel, 6),
         notional: round(notional, 2),
+        // NET of the estimated maker round-trip fee (F1.2).
         profitPerRoundTrip: round(profitPerRoundTrip, 4),
+        profitPerRoundTripGross: round(profitPerRoundTripGross, 4),
+        feePerRoundTrip: round(feePerRoundTrip, 4),
         midPrice: round(midPrice, 2),
         liquidationEstimate: round(liquidationEstimate, 2),
         liqDistancePct: round(liqDistancePct, 2),
