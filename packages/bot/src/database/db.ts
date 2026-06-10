@@ -61,6 +61,11 @@ export interface GridBot {
   // H.3: stop-loss / take-profit (null = disabled)
   sl_pct?: number | null;
   tp_pct?: number | null;
+  // F2.3: escalación de cierres SL/TP a market order cuando la fase limit
+  // se estanca o hay gap de precio. Default 1 (ON). 0 = opt-out para
+  // usuarios que prefieren cierres limit-only (control de slippage) — el
+  // cierre se comporta exactamente como el verified-close clásico.
+  close_escalation?: number | null;
   // H.2: dynamic grid auto-shift
   auto_shift_enabled?: number;
   auto_shift_pct?: number | null;
@@ -374,6 +379,11 @@ export class GridBotDB {
       // H.3: stop-loss / take-profit
       'sl_pct REAL',
       'tp_pct REAL',
+      // F2.3: escalación de cierres SL/TP a market (default ON). SQLite
+      // aplica el DEFAULT a las filas existentes en el ALTER, así que los
+      // bots legacy quedan con escalación habilitada (el comportamiento
+      // seguro: un SL que no puede ejecutarse no es un SL).
+      'close_escalation INTEGER DEFAULT 1',
       // H.2: dynamic grid auto-shift
       'auto_shift_enabled INTEGER DEFAULT 0',
       'auto_shift_pct REAL',
