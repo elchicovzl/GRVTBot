@@ -11,7 +11,9 @@ import {
   type BotSummary,
   type Candle,
   type CandleInterval,
+  type DailyPnlResponse,
   type DailySnapshot,
+  type FeeSummary,
   type FillRow,
   type FundingRow,
   type GridState,
@@ -146,6 +148,14 @@ export const api = {
 
   getRebateSummary: (id: number) =>
     request<RebateSummary>(`/bots/${id}/rebate-summary`),
+
+  // F4.4: maker/taker/rebate fee breakdown from real GRVT fills.
+  getFeeSummary: (id: number) =>
+    request<FeeSummary>(`/bots/${id}/fee-summary`),
+
+  // F4.4: per-day PnL deltas for the daily bar chart (30 days default).
+  getDailyPnl: (id: number, days = 30) =>
+    request<DailyPnlResponse>(`/bots/${id}/daily-pnl?days=${days}`),
 
   // H.7: portfolio-level aggregates across all user bots.
   getPortfolioSummary: () =>

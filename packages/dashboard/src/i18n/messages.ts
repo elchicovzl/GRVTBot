@@ -216,6 +216,8 @@ export const MESSAGES = {
       cardRealized: 'Realizado',
       cardUnrealized: 'No realizado',
       cardInvestment: 'Inversión',
+      cardApr: 'APR',
+      cardDaysActive: 'Días activo',
       createBtn: '+ Crear bot',
       filterStatus: 'Filtrar por estado',
       all: 'Todos',
@@ -269,6 +271,16 @@ export const MESSAGES = {
       avgPerDayNet: 'Promedio/día (neto)',
       makerRebateLabel: 'Rebate maker ({count} fills)',
       funding: 'Funding',
+      apr: 'APR (anualizado)',
+    },
+    feeBreakdown: {
+      title: 'Desglose de fees',
+      totalNet: 'Fees netos',
+      taker: 'Fees pagados (taker)',
+      rebates: 'Rebates maker',
+      pctOfGross: '% del profit bruto',
+      roundtrips: 'Round trips',
+      fills: 'Fills',
     },
     botDetail: {
       backToList: '← Volver a la lista',
@@ -289,6 +301,16 @@ export const MESSAGES = {
       closeBotHint: 'Cancela todas las órdenes y cierra la posición — parada final',
       gridChart: 'Gráfico de grilla',
       equityCurve: 'Curva de equity',
+      dailyPnl: {
+        title: 'PnL diario (30 días)',
+        empty: 'Todavía no hay snapshots diarios',
+      },
+      gridLadder: {
+        title: 'Grilla vs precio',
+        fundingRate: 'Funding',
+        fundingHint:
+          'Funding rate actual del instrumento (positivo = los longs pagan)',
+      },
       stopLossTakeProfit: 'Stop-loss / Take-profit',
       subAccountFallback: 'Sub #{id}',
       stat: {
@@ -957,6 +979,8 @@ export const MESSAGES = {
       cardRealized: 'Realized',
       cardUnrealized: 'Unrealized',
       cardInvestment: 'Investment',
+      cardApr: 'APR',
+      cardDaysActive: 'Days active',
       createBtn: '+ Create bot',
       filterStatus: 'Filter by status',
       all: 'All',
@@ -1010,6 +1034,16 @@ export const MESSAGES = {
       avgPerDayNet: 'Avg/day (net)',
       makerRebateLabel: 'Maker rebate ({count} fills)',
       funding: 'Funding',
+      apr: 'APR (annualized)',
+    },
+    feeBreakdown: {
+      title: 'Fee breakdown',
+      totalNet: 'Net fees',
+      taker: 'Fees paid (taker)',
+      rebates: 'Maker rebates',
+      pctOfGross: '% of gross profit',
+      roundtrips: 'Round trips',
+      fills: 'Fills',
     },
     botDetail: {
       backToList: '← Back to list',
@@ -1030,6 +1064,16 @@ export const MESSAGES = {
       closeBotHint: 'Cancel all orders and close the position — final stop',
       gridChart: 'Grid Chart',
       equityCurve: 'Equity curve',
+      dailyPnl: {
+        title: 'Daily P&L (30 days)',
+        empty: 'No daily snapshots yet',
+      },
+      gridLadder: {
+        title: 'Grid vs price',
+        fundingRate: 'Funding',
+        fundingHint:
+          'Current funding rate for the instrument (positive = longs pay)',
+      },
       stopLossTakeProfit: 'Stop-loss / Take-profit',
       subAccountFallback: 'Sub #{id}',
       stat: {

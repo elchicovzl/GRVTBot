@@ -9,7 +9,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Card } from './primitives/card';
 import { Mono } from './primitives/mono';
 import { api } from '@/lib/api-client';
-import { formatPnl, formatUsd } from '@/lib/format';
+import { formatPercent, formatPnl, formatUsd } from '@/lib/format';
 import type { BotSummary } from '@/lib/api-types';
 import { useT } from '@/i18n';
 
@@ -95,6 +95,19 @@ export function StatsPanel({ bot }: StatsPanelProps) {
           label={t('statsPanel.avgPerDayNet')}
           value={formatUsd(avgPerDay)}
           tone={avgPerDay > 0 ? 'success' : avgPerDay < 0 ? 'danger' : 'default'}
+        />
+        {/* F4.4: APR, computed server-side from the funding-aware PnL on
+            the ORIGINAL investment. "—" for bots younger than 1 day. */}
+        <Row
+          label={t('statsPanel.apr')}
+          value={bot.apr_pct != null ? formatPercent(bot.apr_pct) : '—'}
+          tone={
+            bot.apr_pct != null && bot.apr_pct > 0
+              ? 'success'
+              : bot.apr_pct != null && bot.apr_pct < 0
+                ? 'danger'
+                : 'default'
+          }
         />
         <hr className="border-border-subtle" />
         <Row

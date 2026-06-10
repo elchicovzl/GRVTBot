@@ -42,6 +42,11 @@ export interface BotSummary {
   active_window_size?: number | null;
   // H.5: optional sub-account this bot routes through. NULL = default creds.
   grvt_sub_account_id?: number | null;
+  // F4.4: server-computed APR — annualized return on the ORIGINAL
+  // investment, funding-aware. null when the bot is < 1 day old (the
+  // dashboard shows "—" instead of an absurd annualized number).
+  days_active?: number | null;
+  apr_pct?: number | null;
 }
 
 export interface GridLevel {
@@ -126,6 +131,40 @@ export interface RebateSummary {
   avgFee: number;
   minFee: number;
   maxFee: number;
+}
+
+// F4.4: trader-facing fee breakdown from GET /api/v2/bots/:id/fee-summary.
+// Computed from fills_archive (fee is SIGNED: negative = maker rebate) and
+// paired_roundtrips. There is no explicit maker/taker flag in the archive —
+// the sign of the fee is the only discriminator GRVT gives us.
+export interface FeeSummary {
+  total_fees_usdt: number;   // signed net: fees paid − rebates earned
+  maker_fees_usdt: number;   // signed (≤ 0): sum of negative fees
+  taker_fees_usdt: number;   // sum of positive fees (paid)
+  rebates_usdt: number;      // −maker_fees_usdt (≥ 0, for display)
+  fee_pct_of_gross_profit: number | null; // null when no gross profit yet
+  roundtrips_count: number;
+  gross_profit_usdt: number;
+  fill_count: number;
+}
+
+// F4.4: per-day PnL deltas from GET /api/v2/bots/:id/daily-pnl?days=N.
+// Derived from daily_snapshots' cumulative columns; funding_delta is the
+// residual total − grid − trend (see the endpoint comment in v2-router).
+export interface DailyPnlPoint {
+  date: string; // YYYY-MM-DD
+  grid_profit_delta: number;
+  trend_pnl_delta: number;
+  funding_delta: number;
+  total_pnl_delta: number;
+  equity: number;
+  round_trips: number;
+}
+
+export interface DailyPnlResponse {
+  botId: number;
+  days: number;
+  points: DailyPnlPoint[];
 }
 
 // Returned by /api/v2/bots/:id/range/preview AND used internally by the

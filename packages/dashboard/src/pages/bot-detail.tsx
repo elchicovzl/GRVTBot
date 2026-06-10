@@ -36,6 +36,9 @@ import { Delta } from '@/components/primitives/delta';
 import { Tabs } from '@/components/primitives/tabs';
 import { DataTable, type Column } from '@/components/primitives/data-table';
 import { EquityCurve } from '@/components/charts/equity-curve';
+import { DailyPnlChart } from '@/components/charts/daily-pnl-chart';
+import { GridLadder } from '@/components/grid-ladder';
+import { FeeBreakdown } from '@/components/fee-breakdown';
 import { StatsPanel } from '@/components/stats-panel';
 import { UpdateRangeDialog } from '@/components/update-range-dialog';
 import {
@@ -93,6 +96,14 @@ export function BotDetailPage() {
       api.getCandles(botQuery.data?.bot.pair ?? 'ETH_USDT_Perp', 'CI_1_H', 200),
     enabled: !!botQuery.data?.bot.pair,
     refetchInterval: 60_000,
+  });
+
+  // F4.4: per-day PnL deltas for the Daily P&L bar chart (30 days).
+  // Snapshots only change once per day — long staleTime is fine.
+  const dailyPnlQuery = useQuery({
+    queryKey: ['daily-pnl', botId],
+    queryFn: () => api.getDailyPnl(botId, 30),
+    staleTime: 5 * 60_000,
   });
 
   // H.5: sub-account label resolution. We share the cache key with
@@ -251,6 +262,7 @@ export function BotDetailPage() {
   // useMarkPrice is a plain helper despite the `use*` name — no hooks
   // inside it. Safe to call after the early return.
   const markPrice = useMarkPrice(gridStateQuery.data);
+  const fundingRate = currentFundingRate(gridStateQuery.data);
   const candles = candlesQuery.data?.candles ?? [];
   const levels: GridLevel[] = gridStateQuery.data?.levels ?? [];
 
@@ -581,6 +593,52 @@ export function BotDetailPage() {
           <BotDetailEquityCurve botId={botId} />
         </Card>
         <StatsPanel bot={bot} />
+      </div>
+
+      {/* F4.4: Daily P&L bars + grid ladder + fee breakdown */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card className="lg:col-span-2 p-5">
+          <h3 className="text-sm font-semibold text-text-primary mb-4">
+            {t('botDetail.dailyPnl.title')}
+          </h3>
+          <DailyPnlChart
+            points={dailyPnlQuery.data?.points ?? []}
+            emptyMessage={t('botDetail.dailyPnl.empty')}
+          />
+        </Card>
+        <div className="flex flex-col gap-4">
+          <Card className="p-5">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-text-primary">
+                {t('botDetail.gridLadder.title')}
+              </h3>
+              {/* Current funding rate — straight from the grid-state
+                  ticker (GRVT fraction → % display, same convention as
+                  the Funding tab). Sign matters: positive = longs pay. */}
+              {fundingRate != null && (
+                <span
+                  className="text-2xs uppercase tracking-wider text-text-muted"
+                  title={t('botDetail.gridLadder.fundingHint')}
+                >
+                  {t('botDetail.gridLadder.fundingRate')}{' '}
+                  <Mono
+                    className={
+                      fundingRate > 0
+                        ? 'text-danger'
+                        : fundingRate < 0
+                          ? 'text-success'
+                          : 'text-text-secondary'
+                    }
+                  >
+                    {(fundingRate * 100).toFixed(4)}%
+                  </Mono>
+                </span>
+              )}
+            </div>
+            <GridLadder levels={levels} markPrice={markPrice} />
+          </Card>
+          <FeeBreakdown botId={botId} />
+        </div>
       </div>
 
       {/* E.6: Fill activity heatmap */}
@@ -1699,6 +1757,20 @@ function FillHeatmapSection({
       spacing={spacing}
     />
   );
+}
+
+// F4.4: current funding rate from the grid-state ticker (the GRVT
+// ticker payload already carries funding_rate — no extra API call).
+// Returned as the raw FRACTION; callers multiply by 100 for % display,
+// matching the Funding tab's convention.
+function currentFundingRate(state: GridState | undefined): number | null {
+  const ticker = state?.ticker as
+    | { funding_rate?: string | number }
+    | undefined;
+  const raw = ticker?.funding_rate;
+  if (raw == null) return null;
+  const num = typeof raw === 'string' ? parseFloat(raw) : raw;
+  return Number.isFinite(num) ? num : null;
 }
 
 function useMarkPrice(state: GridState | undefined): number | null {
