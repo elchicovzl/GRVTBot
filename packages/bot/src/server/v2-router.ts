@@ -2045,8 +2045,12 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       res.status(201).json({ id: botId, status: 'paused' });
     } catch (err) {
       log.error({ err: (err as Error).message }, 'bot creation failed');
-      res.status(500).json({
-        error: 'create_failed',
+      // Engine validation errors (e.g. spacing below the round-trip fee
+      // floor) carry status=400 — surface them as such so the wizard
+      // shows the explanation instead of a generic server error.
+      const status = (err as Error & { status?: number }).status ?? 500;
+      res.status(status).json({
+        error: status === 400 ? 'validation_failed' : 'create_failed',
         message: (err as Error).message,
       });
     }
@@ -2330,8 +2334,11 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         { botId: id, lowerPrice, upperPrice, err: (err as Error).message },
         'bot range update failed'
       );
-      res.status(500).json({
-        error: 'range_update_failed',
+      // Safety-violation refusals (engine sets status=400) are the
+      // user's range being invalid, not a server failure.
+      const status = (err as Error & { status?: number }).status ?? 500;
+      res.status(status).json({
+        error: status === 400 ? 'range_update_refused' : 'range_update_failed',
         message: (err as Error).message,
       });
     }

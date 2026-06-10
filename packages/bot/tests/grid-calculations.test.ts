@@ -352,3 +352,104 @@ describe('GridEngine.calculateGridLevels', () => {
     );
   });
 });
+
+// ── 4. F1.1 — minimum profitable spacing validation ──────────────────
+// A grid whose spacing is below the round-trip fee cost loses money on
+// EVERY cycle. createBot must refuse such configs; resume of existing
+// (legacy) bots must NOT be blocked.
+
+describe('minimum profitable spacing validation (F1.1)', () => {
+  let engine: GridEngine;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    engine = new GridEngine();
+    mockGrvtClient.getTicker.mockResolvedValue({ last_price: '2100' });
+    mockGrvtClient.calculateLiquidationPrice.mockResolvedValue('1200.00');
+    mockDb.createBot.mockResolvedValue(7);
+    mockDb.getGridLevels.mockResolvedValue([]);
+    mockDb.getBotsByStatus.mockResolvedValue([]);
+  });
+
+  it('createBot rejects spacing below the fee floor with an explanatory error', async () => {
+    // range 2090-2110, 10 grids → spacing $2.00
+    // fee floor at mid 2100: 2 * 2100 * 0.0005 * 1.5 = $3.15
+    await expect(
+      engine.createBot({
+        pair: 'ETH_USDT_Perp',
+        direction: 'long',
+        leverage: 2,
+        lowerPrice: 2090,
+        upperPrice: 2110,
+        numGrids: 10,
+        investmentUSDT: 500,
+      })
+    ).rejects.toThrow(/minimum profitable spacing/);
+
+    // Nothing persisted — validation fails before any DB write.
+    expect(mockDb.createBot).not.toHaveBeenCalled();
+  });
+
+  it('rejection message includes actual spacing, the floor, and the fee reason', async () => {
+    const err = await engine
+      .createBot({
+        pair: 'ETH_USDT_Perp',
+        direction: 'long',
+        leverage: 2,
+        lowerPrice: 2090,
+        upperPrice: 2110,
+        numGrids: 10,
+        investmentUSDT: 500,
+      })
+      .then(
+        () => null,
+        (e: Error & { status?: number }) => e
+      );
+
+    expect(err).not.toBeNull();
+    expect(err!.message).toContain('$2.00');   // actual spacing
+    expect(err!.message).toContain('$3.15');   // minimum required
+    expect(err!.message).toMatch(/fees/);      // why
+    expect(err!.status).toBe(400);             // API maps it to a 400
+  });
+
+  it('createBot accepts a healthy spacing well above the fee floor', async () => {
+    // range 1800-2400, 10 grids → spacing $60 >> $3.15 floor
+    const botId = await engine.createBot({
+      pair: 'ETH_USDT_Perp',
+      direction: 'long',
+      leverage: 2,
+      lowerPrice: 1800,
+      upperPrice: 2400,
+      numGrids: 10,
+      investmentUSDT: 500,
+    });
+
+    expect(botId).toBe(7);
+    expect(mockDb.createBot).toHaveBeenCalledTimes(1);
+  });
+
+  it('resume path (startBot) is NOT blocked for a legacy bot with tight spacing', async () => {
+    // Legacy bot already in DB with spacing $2 (below today's floor).
+    // startBot RESUMES it (live position exists) without re-validating
+    // the config — the fee floor only applies to create/edit.
+    mockDb.getBot.mockResolvedValue({
+      id: 7,
+      pair: 'ETH_USDT_Perp',
+      direction: 'long',
+      leverage: 2,
+      lower_price: 2090,
+      upper_price: 2110,
+      num_grids: 10,
+      investment_usdt: 500,
+      quantity_per_level: 0.05,
+      status: 'paused',
+      virtual_enabled: 0,
+    });
+    mockGrvtClient.getOpenOrders.mockResolvedValue([]);
+    mockGrvtClient.getPosition.mockResolvedValue({ size: '0.05' }); // → RESUME path
+
+    await expect(engine.startBot(7)).resolves.toBeUndefined();
+    expect(mockDb.updateBot).toHaveBeenCalledWith(7, { status: 'running' });
+  });
+});
