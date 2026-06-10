@@ -144,29 +144,151 @@ class RateLimiter {
 
   async waitIfNeeded(): Promise<void> {
     const now = Date.now();
-    
+
     // Remover requests viejos (fuera de ventana)
     this.requests = this.requests.filter(time => now - time < this.timeWindow);
-    
+
     // Si estamos en el límite, esperar
     if (this.requests.length >= this.maxRequests) {
       const oldestRequest = this.requests[0];
       if (oldestRequest) {
         const waitTime = this.timeWindow - (now - oldestRequest) + 50; // +50ms safety
-        
+
         if (waitTime > 0) {
           console.log(`⏳ Rate limit: esperando ${waitTime}ms`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
         }
       }
     }
-    
+
     // Registrar nueva request
     this.requests.push(now);
   }
 }
 
-const rateLimiter = new RateLimiter();
+// ─── Per-user rate buckets ──────────────────────────────────────────
+// GRVT enforces rate limits PER ACCOUNT, but the old implementation was a
+// single module-level RateLimiter shared by every GRVTClient instance. In
+// multi-tenant mode that made user B's bots queue behind user A's burst
+// even though they hit different account quotas. Buckets are keyed by the
+// GRVT account id (falling back to the API key), so:
+//   - different users never contend on the same bucket
+//   - multiple clients/bots of the SAME account share one bucket
+//     (the account quota is shared no matter how many clients we create)
+// The legacy env-based singleton uses a fixed 'legacy-env' bucket.
+const rateBuckets = new Map<string, RateLimiter>();
+
+function getRateBucket(key: string): RateLimiter {
+  let bucket = rateBuckets.get(key);
+  if (!bucket) {
+    bucket = new RateLimiter();
+    rateBuckets.set(key, bucket);
+  }
+  return bucket;
+}
+
+/** Test-only: drop all rate buckets so each test starts clean. */
+export function __resetRateBucketsForTests(): void {
+  rateBuckets.clear();
+}
+
+// ─── Request coalescing for public/idempotent reads ─────────────────
+// Multiple bots frequently ask for the same ticker within the same second.
+// Coalescing shares ONE in-flight promise + a short-TTL cached result per
+// key instead of issuing N identical API calls. Applied ONLY to public,
+// safe-to-share data (ticker, instrument metadata) — never to user-specific
+// endpoints (orders, balance, fills).
+//
+// Note: server/cache.ts has a TtlCache, but (a) it lives in the server layer
+// and importing it here would pull pino into every client consumer, and
+// (b) it explicitly does NOT dedupe in-flight fetchers (racing callers both
+// call the fetcher — see its getOrFetch doc). The in-flight map is the whole
+// point here, so we keep a minimal local implementation.
+const TICKER_COALESCE_TTL_MS = 1000;
+const INSTRUMENTS_COALESCE_TTL_MS = 10_000;
+
+interface CoalesceEntry {
+  value: unknown;
+  expiresAt: number;
+}
+
+const coalesceCache = new Map<string, CoalesceEntry>();
+const coalesceInflight = new Map<string, Promise<unknown>>();
+
+async function coalesce<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  const hit = coalesceCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.value as T;
+  }
+  const pending = coalesceInflight.get(key);
+  if (pending) {
+    return pending as Promise<T>;
+  }
+  const p = (async () => {
+    try {
+      const value = await fetcher();
+      // Only successes are cached — a rejection propagates to all current
+      // waiters and the next caller retries fresh.
+      coalesceCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+      return value;
+    } finally {
+      coalesceInflight.delete(key);
+    }
+  })();
+  coalesceInflight.set(key, p);
+  return p;
+}
+
+/** Test-only: drop coalescing state so each test starts clean. */
+export function __resetCoalesceForTests(): void {
+  coalesceCache.clear();
+  coalesceInflight.clear();
+}
+
+// ─── 429 backoff with jitter ────────────────────────────────────────
+// When GRVT answers 429 on a READ, retry with exponential backoff + equal
+// jitter. Mutations (createOrder/cancelOrder/setLeverage) are intentionally
+// NOT retried here: grid-engine has its own 429 handling for createOrder,
+// and blindly retrying mutations risks duplicates.
+const MAX_429_RETRIES = 3;
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_CAP_MS = 8000;
+
+function is429RateLimit(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (!error.message.includes('HTTP 429')) return false;
+  // GRVT also uses HTTP 429 for the app-level "Max open orders exceeded"
+  // (code 2090) — backing off won't fix that, let the caller handle it.
+  if (error.message.includes('2090')) return false;
+  return true;
+}
+
+function backoffDelayMs(attempt: number): number {
+  const exp = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
+  // Equal jitter: half fixed + half random, so retries de-synchronize
+  // across bots instead of stampeding GRVT again in lockstep.
+  return Math.floor(exp / 2 + Math.random() * (exp / 2));
+}
+
+async function withRateLimitBackoff<T>(
+  ctx: { user: string; endpoint: string },
+  fn: () => Promise<T>
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!is429RateLimit(error) || attempt >= MAX_429_RETRIES) {
+        throw error;
+      }
+      const delay = backoffDelayMs(attempt);
+      console.warn(
+        `⚠️ GRVT 429 rate-limited (user=${ctx.user}, endpoint=${ctx.endpoint}) — retry ${attempt + 1}/${MAX_429_RETRIES} in ${delay}ms`
+      );
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
 
 // H.1: dynamic instrument specs cache. Populated by getInstruments(),
 // with hardcoded fallbacks for the most common pairs so the bot works even
@@ -218,10 +340,16 @@ export class GRVTClient {
   private creds: GrvtClientCreds | null;
   // Per-instance auth state so each user's cookie session is isolated.
   private instanceAuthState: import('./auth.js').AuthState;
+  // Rate bucket key: GRVT account id (rate limits are per account), so all
+  // clients of the same user share one bucket and different users never
+  // contend. Falls back to apiKey if accountId is empty; legacy env path
+  // uses a fixed key.
+  private rateBucketKey: string;
 
   constructor(creds?: GrvtClientCreds) {
     this.instanceAuthState = createEmptyAuthState();
     this.creds = creds ?? null;
+    this.rateBucketKey = creds ? (creds.accountId || creds.apiKey) : 'legacy-env';
 
     if (creds) {
       this.tradingAccountId = creds.subAccountId;
@@ -267,6 +395,27 @@ export class GRVTClient {
     return authenticatedRequest(url, body, options);
   }
 
+  /** Wait on this client's per-account rate bucket. */
+  private rateLimit(): Promise<void> {
+    return getRateBucket(this.rateBucketKey).waitIfNeeded();
+  }
+
+  /** Identity string for 429 warning logs. */
+  private get userLabel(): string {
+    return this.creds ? `account=${this.creds.accountId} sub=${this.creds.subAccountId}` : 'legacy-env';
+  }
+
+  /**
+   * Run an idempotent READ with 429 backoff. Each retry attempt re-acquires
+   * a rate-bucket slot so retries also count against the account quota.
+   */
+  private readWithBackoff<T>(endpoint: string, fn: () => Promise<T>, rateLimited = true): Promise<T> {
+    return withRateLimitBackoff({ user: this.userLabel, endpoint }, async () => {
+      if (rateLimited) await this.rateLimit();
+      return fn();
+    });
+  }
+
   /** Get the signing credentials for this client (for order-signer). */
   getSigningCreds(): { privateKey: string; signerAddress: string; subAccountId: string } {
     if (this.creds) {
@@ -292,10 +441,13 @@ export class GRVTClient {
    * Obtener ticker para un instrumento
    */
   async getTicker(instrument: string): Promise<Ticker> {
-    const data = await publicRequest(`${MARKET_DATA_URL}/ticker`, {
-      instrument
-    });
-    return data;
+    // Coalesced: N concurrent callers for the same instrument share one
+    // in-flight request + a ~1s cached result. Public data, safe to share
+    // across users.
+    return coalesce(`ticker:${instrument}`, TICKER_COALESCE_TTL_MS, () =>
+      this.readWithBackoff('ticker', () =>
+        publicRequest(`${MARKET_DATA_URL}/ticker`, { instrument }), false)
+    );
   }
 
   /**
@@ -310,7 +462,12 @@ export class GRVTClient {
    * Obtener instrumentos disponibles
    */
   async getInstruments(): Promise<any[]> {
-    const data = await publicRequest(`${MARKET_DATA_URL}/instruments`, {});
+    // Coalesced: instrument metadata is identical for every user and changes
+    // rarely, so concurrent/bursty callers share one request for 10s.
+    const data = await coalesce('instruments', INSTRUMENTS_COALESCE_TTL_MS, () =>
+      this.readWithBackoff('instruments', () =>
+        publicRequest(`${MARKET_DATA_URL}/instruments`, {}), false)
+    );
     // H.1: cache instrument specs for dynamic pair support.
     // H.8: also cache instrument_hash + base_decimals for EIP-712 signing.
     if (Array.isArray(data)) {
@@ -357,12 +514,13 @@ export class GRVTClient {
     interval: string = 'CI_1_H',
     limit: number = 500
   ): Promise<KlineCandle[]> {
-    const data = await publicRequest(`${MARKET_DATA_URL}/kline`, {
-      instrument,
-      interval,
-      type: 'TRADE',
-      limit
-    });
+    const data = await this.readWithBackoff('kline', () =>
+      publicRequest(`${MARKET_DATA_URL}/kline`, {
+        instrument,
+        interval,
+        type: 'TRADE',
+        limit
+      }), false);
     // publicRequest already unwraps `.result` from the GRVT envelope, so
     // `data` is normally the rows array. But if GRVT ever returns the
     // wrapped object directly we still want to handle it — accept both.
@@ -389,12 +547,11 @@ export class GRVTClient {
    * Obtener balance de la cuenta trading
    */
   async getBalance(): Promise<Balance> {
-    await rateLimiter.waitIfNeeded();
-    
-    const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
-      sub_account_id: this.tradingAccountId
-    });
-    
+    const data = await this.readWithBackoff('account_summary', () =>
+      this.authedRequest(`${TRADING_URL}/account_summary`, {
+        sub_account_id: this.tradingAccountId
+      }));
+
     return {
       sub_account_id: this.tradingAccountId,
       total_equity: data.total_equity || '0',
@@ -410,9 +567,8 @@ export class GRVTClient {
    * Obtener todas las posiciones
    */
   async getPositions(): Promise<Position[]> {
-    await rateLimiter.waitIfNeeded();
-    
-    const data = await this.authedRequest(`${TRADING_URL}/positions`, { sub_account_id: this.tradingAccountId });
+    const data = await this.readWithBackoff('positions', () =>
+      this.authedRequest(`${TRADING_URL}/positions`, { sub_account_id: this.tradingAccountId }));
     return Array.isArray(data) ? data : [];
   }
 
@@ -428,14 +584,13 @@ export class GRVTClient {
    * Obtener órdenes abiertas
    */
   async getOpenOrders(instrument?: string): Promise<Order[]> {
-    await rateLimiter.waitIfNeeded();
-
     const body: any = { sub_account_id: this.tradingAccountId };
     if (instrument) {
       body.instrument = instrument;
     }
 
-    const data = await this.authedRequest(`${TRADING_URL}/open_orders`, body);
+    const data = await this.readWithBackoff('open_orders', () =>
+      this.authedRequest(`${TRADING_URL}/open_orders`, body));
     const all = Array.isArray(data) ? data : [];
 
     // DEFENSIVE: GRVT's open_orders endpoint sometimes ignores the `instrument`
@@ -458,8 +613,8 @@ export class GRVTClient {
    * ⚠️ ACTUALIZADO: endpoint /full/v1/create_order con formato verificado
    */
   async createOrder(request: CreateOrderRequest, allowMarket: boolean = false): Promise<Order> {
-    await rateLimiter.waitIfNeeded();
-    
+    await this.rateLimit();
+
     // SAFEGUARD: Solo órdenes LIMIT excepto casos especiales (compra inicial/cierre)
     if (request.type !== 'limit' && !allowMarket) {
       throw new Error('SAFEGUARD: Solo se permiten órdenes LIMIT (usar allowMarket=true para casos especiales)');
@@ -538,8 +693,8 @@ export class GRVTClient {
    * Cancelar orden específica
    */
   async cancelOrder(orderId: string, instrument: string): Promise<boolean> {
-    await rateLimiter.waitIfNeeded();
-    
+    await this.rateLimit();
+
     console.log(`❌ Cancelando orden: ${orderId}`);
     
     try {
@@ -559,8 +714,8 @@ export class GRVTClient {
    * Cancelar todas las órdenes (por instrumento o todas)
    */
   async cancelAllOrders(instrument?: string): Promise<number> {
-    await rateLimiter.waitIfNeeded();
-    
+    await this.rateLimit();
+
     console.log(instrument ? 
       `❌ Cancelando todas las órdenes de ${instrument}` :
       '❌ Cancelando TODAS las órdenes'
@@ -586,7 +741,7 @@ export class GRVTClient {
    * Establecer leverage para un instrumento
    */
   async setLeverage(instrument: string, leverage: number): Promise<boolean> {
-    await rateLimiter.waitIfNeeded();
+    await this.rateLimit();
 
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
 
@@ -623,11 +778,10 @@ export class GRVTClient {
    * mientras la DB muestra el nuevo. Esta lectura permite fallar-cerrado.
    */
   async getAppliedLeverage(instrument: string): Promise<number | null> {
-    await rateLimiter.waitIfNeeded();
-
-    const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
-      sub_account_id: this.tradingAccountId
-    });
+    const data = await this.readWithBackoff('account_summary', () =>
+      this.authedRequest(`${TRADING_URL}/account_summary`, {
+        sub_account_id: this.tradingAccountId
+      }));
 
     if (data.positions && Array.isArray(data.positions)) {
       const pos = data.positions.find((p: any) => p.instrument === instrument);
@@ -673,8 +827,6 @@ export class GRVTClient {
     instrument?: string,
     endTimeNs?: string
   ): Promise<Fill[]> {
-    await rateLimiter.waitIfNeeded();
-
     const body: any = {
       sub_account_id: this.tradingAccountId,
       limit: Math.min(limit, 1000)
@@ -687,7 +839,8 @@ export class GRVTClient {
       body.end_time = endTimeNs;
     }
 
-    const data = await this.authedRequest(`${TRADING_URL}/fill_history`, body);
+    const data = await this.readWithBackoff('fill_history', () =>
+      this.authedRequest(`${TRADING_URL}/fill_history`, body));
     return Array.isArray(data) ? data : [];
   }
 
@@ -696,8 +849,6 @@ export class GRVTClient {
    * ⚠️ FIX: GRVT usa POST para funding_history según specs
    */
   async getFundingHistory(limit: number = 100, instrument?: string): Promise<FundingPayment[]> {
-    await rateLimiter.waitIfNeeded();
-    
     const body: any = {
       sub_account_id: this.tradingAccountId,
       limit: Math.min(limit, 1000)
@@ -712,9 +863,10 @@ export class GRVTClient {
       console.log(`📡 [DEBUG] Getting funding from account_summary (funding_history no disponible)...`);
       
       // Obtener account_summary que incluye cumulative_realized_funding_payment
-      const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
-        sub_account_id: this.tradingAccountId
-      });
+      const data = await this.readWithBackoff('account_summary', () =>
+        this.authedRequest(`${TRADING_URL}/account_summary`, {
+          sub_account_id: this.tradingAccountId
+        }));
       
       const fundingPayments: FundingPayment[] = [];
 
