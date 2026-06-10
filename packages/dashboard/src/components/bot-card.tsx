@@ -122,6 +122,16 @@ export function BotCard({ bot }: BotCardProps) {
           <SummaryRow label={t('bots.cardRealized')} value={formatPnl(gridProfit)} />
           <SummaryRow label={t('bots.cardUnrealized')} value={formatPnl(trendPnl)} />
           <SummaryRow label={t('bots.cardInvestment')} value={formatUsd(bot.investment_usdt)} />
+          {/* F4.4: server-computed APR (annualized, on the original
+              investment). null while the bot is < 1 day old → "—". */}
+          <SummaryRow
+            label={t('bots.cardApr')}
+            value={bot.apr_pct != null ? formatPercent(bot.apr_pct) : '—'}
+          />
+          <SummaryRow
+            label={t('bots.cardDaysActive')}
+            value={bot.days_active != null ? String(Math.floor(bot.days_active)) : '—'}
+          />
         </dl>
       </Card>
     </Link>

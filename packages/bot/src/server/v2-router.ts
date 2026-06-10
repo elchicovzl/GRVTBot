@@ -106,6 +106,55 @@ function round(n: number, digits: number): number {
   return Math.round(n * f) / f;
 }
 
+const MS_PER_DAY = 86_400_000;
+
+// SQLite CURRENT_TIMESTAMP produces 'YYYY-MM-DD HH:MM:SS' in UTC but
+// WITHOUT a timezone marker — Date.parse would interpret it as LOCAL
+// time and skew days_active by the server's UTC offset. Normalize to
+// ISO-8601 UTC before parsing. ISO strings and epoch numbers pass through.
+function parseSqliteUtcMs(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const s = String(value).trim();
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)
+    ? s.replace(' ', 'T') + 'Z'
+    : s;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// APR per bot: (total_pnl / original_investment) / (days_active / 365) * 100.
+//
+// Edge cases:
+//   - bots active < 1 day → apr_pct = null (annualizing a few hours of
+//     PnL produces absurd four-digit percentages; the dashboard shows "—")
+//   - original_investment_usdt NULL/0 on legacy rows → fall back to
+//     investment_usdt; if that is also <= 0 → null
+//   - unparseable created_at → both fields null
+//
+// totalPnl passed in should be the funding-aware rebuild
+// (grid_profit_usdt + trend_pnl_usdt + net_funding) — the same formula
+// /portfolio-summary uses — NOT the stale total_pnl_usdt column.
+function computeBotApr(
+  totalPnl: number,
+  originalInvestment: number | null | undefined,
+  investmentFallback: number,
+  createdAt: unknown
+): { days_active: number | null; apr_pct: number | null } {
+  const createdMs = parseSqliteUtcMs(createdAt);
+  if (createdMs == null) return { days_active: null, apr_pct: null };
+  const daysActive = Math.max(0, (Date.now() - createdMs) / MS_PER_DAY);
+  const principal =
+    originalInvestment != null && originalInvestment > 0
+      ? originalInvestment
+      : investmentFallback;
+  if (daysActive < 1 || !(principal > 0)) {
+    return { days_active: round(daysActive, 2), apr_pct: null };
+  }
+  const apr = (totalPnl / principal) / (daysActive / 365) * 100;
+  return { days_active: round(daysActive, 2), apr_pct: round(apr, 2) };
+}
+
 function dbAll<T = unknown>(db: Database.Database, sql: string, params: unknown[] = []): Promise<T[]> {
   return new Promise((resolve, reject) => {
     db.all(sql, params, (err, rows) => {
@@ -1057,12 +1106,21 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
   // ── GET /api/v2/bots ──────────────────────────────────────────────
   // List all bots with the fields the dashboard cares about.
+  // Each row is augmented with `days_active` + `apr_pct` (annualized
+  // return on the ORIGINAL investment, funding-aware — see computeBotApr).
   router.get('/bots', asyncHandler(async (req, res) => {
     // Multi-tenant: list only the bots owned by this user. Legacy
     // rows with NULL user_id are treated as user 1's so they keep
     // showing up after the migration.
     const userId = req.userId!;
-    const rows = await dbAll(db, `
+    const rows = await dbAll<{
+      id: number;
+      created_at: string;
+      investment_usdt: number;
+      original_investment_usdt: number | null;
+      grid_profit_usdt: number;
+      trend_pnl_usdt: number;
+    }>(db, `
       SELECT id, pair, direction, leverage, lower_price, upper_price, num_grids,
              investment_usdt, grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
              status, position_size, avg_entry_price, liquidation_price,
@@ -1076,7 +1134,33 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       WHERE COALESCE(user_id, 1) = ?
       ORDER BY created_at DESC
     `, [userId]);
-    res.json({ bots: rows });
+
+    // Net funding per bot (signed, same formula as /portfolio-summary)
+    // so APR is computed on the funding-aware PnL, not the stale
+    // total_pnl_usdt column.
+    const fundingRows = await dbAll<{ bot_id: number; net: number }>(db, `
+      SELECT bot_id, COALESCE(SUM(carried_net + (latest_cumulative - baseline_cumulative)), 0) AS net
+      FROM funding_snapshots
+      WHERE bot_id IN (SELECT id FROM grid_bots WHERE COALESCE(user_id, 1) = ?)
+      GROUP BY bot_id
+    `, [userId]);
+    const netFundingByBot = new Map<number, number>();
+    for (const r of fundingRows) netFundingByBot.set(r.bot_id, r.net);
+
+    const bots = rows.map((b) => {
+      const totalPnl =
+        (b.grid_profit_usdt ?? 0) +
+        (b.trend_pnl_usdt ?? 0) +
+        (netFundingByBot.get(b.id) ?? 0);
+      const apr = computeBotApr(
+        totalPnl,
+        b.original_investment_usdt,
+        b.investment_usdt,
+        b.created_at
+      );
+      return { ...b, ...apr };
+    });
+    res.json({ bots });
     return;
   }));
 
@@ -1085,9 +1169,31 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
     await requireBotOwnership(db, id, req.userId!);
-    const bot = await dbGet(db, `SELECT * FROM grid_bots WHERE id = ?`, [id]);
+    const bot = await dbGet<{
+      created_at: string;
+      investment_usdt: number;
+      original_investment_usdt: number | null;
+      grid_profit_usdt: number;
+      trend_pnl_usdt: number;
+    }>(db, `SELECT * FROM grid_bots WHERE id = ?`, [id]);
     if (!bot) return res.status(404).json({ error: 'bot not found' });
-    res.json({ bot });
+    // Same APR augmentation as the list endpoint (funding-aware PnL).
+    const fundingRow = await dbGet<{ net: number }>(db, `
+      SELECT COALESCE(SUM(carried_net + (latest_cumulative - baseline_cumulative)), 0) AS net
+      FROM funding_snapshots
+      WHERE bot_id = ?
+    `, [id]);
+    const totalPnl =
+      (bot.grid_profit_usdt ?? 0) +
+      (bot.trend_pnl_usdt ?? 0) +
+      (fundingRow?.net ?? 0);
+    const apr = computeBotApr(
+      totalPnl,
+      bot.original_investment_usdt,
+      bot.investment_usdt,
+      bot.created_at
+    );
+    res.json({ bot: { ...bot, ...apr } });
     return;
   }));
 
@@ -1342,6 +1448,131 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       minFee: row?.min_fee ?? 0,
       maxFee: row?.max_fee ?? 0,
     });
+    return;
+  }));
+
+  // ── GET /api/v2/bots/:id/fee-summary ──────────────────────────────
+  // F4.4: trader-facing fee breakdown, computed from fills_archive
+  // (fee is SIGNED: negative = maker rebate earned, positive = fee
+  // paid) and paired_roundtrips (gross grid profit).
+  //
+  // fills_archive carries no explicit maker/taker flag — the sign of
+  // the fee is the only discriminator GRVT gives us. Convention here:
+  //   maker_fees_usdt  = Σ fee WHERE fee < 0  (signed, ≤ 0 — net maker
+  //                      rebates expressed as a negative "fee")
+  //   taker_fees_usdt  = Σ fee WHERE fee > 0  (fees actually paid)
+  //   rebates_usdt     = -maker_fees_usdt     (≥ 0, for direct display)
+  //   total_fees_usdt  = Σ fee                (signed net)
+  //   fee_pct_of_gross_profit = total_fees / Σ(roundtrip profit) * 100
+  //                      (null when there is no gross profit yet —
+  //                       a percentage of zero is meaningless)
+  router.get('/bots/:id/fee-summary', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
+
+    const feeRow = await dbGet<{
+      fill_count: number;
+      total_fees: number;
+      taker_fees: number;
+      maker_fees: number;
+    }>(db, `
+      SELECT COUNT(*) AS fill_count,
+             COALESCE(SUM(fee), 0) AS total_fees,
+             COALESCE(SUM(CASE WHEN fee > 0 THEN fee ELSE 0 END), 0) AS taker_fees,
+             COALESCE(SUM(CASE WHEN fee < 0 THEN fee ELSE 0 END), 0) AS maker_fees
+      FROM fills_archive
+      WHERE bot_id = ?
+    `, [id]);
+
+    const rtRow = await dbGet<{ c: number; gross: number }>(db, `
+      SELECT COUNT(*) AS c, COALESCE(SUM(profit), 0) AS gross
+      FROM paired_roundtrips
+      WHERE bot_id = ?
+    `, [id]);
+
+    const totalFees = feeRow?.total_fees ?? 0;
+    const makerFees = feeRow?.maker_fees ?? 0;
+    const grossProfit = rtRow?.gross ?? 0;
+
+    res.json({
+      total_fees_usdt: round(totalFees, 6),
+      maker_fees_usdt: round(makerFees, 6),
+      taker_fees_usdt: round(feeRow?.taker_fees ?? 0, 6),
+      rebates_usdt: round(-makerFees, 6),
+      fee_pct_of_gross_profit:
+        grossProfit > 0 ? round((totalFees / grossProfit) * 100, 2) : null,
+      roundtrips_count: rtRow?.c ?? 0,
+      gross_profit_usdt: round(grossProfit, 6),
+      fill_count: feeRow?.fill_count ?? 0,
+    });
+    return;
+  }));
+
+  // ── GET /api/v2/bots/:id/daily-pnl?days=30 ────────────────────────
+  // F4.4: per-day PnL deltas derived from daily_snapshots (which store
+  // CUMULATIVE values written once per day by the engine):
+  //   grid_profit_delta = Δ grid_profit_net   (realized, net of fees)
+  //   trend_pnl_delta   = Δ trend_pnl         (change in unrealized)
+  //   total_pnl_delta   = Δ total_pnl         (grid + trend + funding)
+  //   funding_delta     = total_pnl_delta - grid_profit_delta - trend_pnl_delta
+  //
+  // funding_delta is a RESIDUAL: total_pnl is funding-aware but the
+  // snapshot doesn't store funding as its own column, so the residual
+  // also absorbs any basis difference between the two grid-profit
+  // sources. Good enough for a per-day bar chart; the authoritative
+  // lifetime funding total stays on /bots/:id/funding.
+  //
+  // Baseline: we fetch days+1 snapshots so the first day in the window
+  // diffs against the day before it. When the bot's history is shorter
+  // than the window, the first snapshot diffs against 0 — correct,
+  // because cumulative columns start at 0 at bot creation.
+  router.get('/bots/:id/daily-pnl', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
+    const daysRaw = parseInt(String(req.query.days ?? '30'), 10);
+    const days = Math.min(Math.max(Number.isFinite(daysRaw) ? daysRaw : 30, 1), 365);
+
+    const rows = await dbAll<{
+      date: string;
+      equity: number;
+      grid_profit_net: number;
+      trend_pnl: number;
+      total_pnl: number;
+      round_trips: number;
+    }>(db, `
+      SELECT date, equity, grid_profit_net, trend_pnl, total_pnl, round_trips
+      FROM daily_snapshots
+      WHERE bot_id = ?
+      ORDER BY date DESC
+      LIMIT ?
+    `, [id, days + 1]);
+    rows.reverse(); // chronological
+
+    // If we got days+1 rows, the oldest is only the baseline.
+    const baseline = rows.length > days ? rows[0]! : null;
+    const windowRows = baseline ? rows.slice(1) : rows;
+
+    let prev = baseline;
+    const points = windowRows.map((r) => {
+      const gridDelta = (r.grid_profit_net ?? 0) - (prev?.grid_profit_net ?? 0);
+      const trendDelta = (r.trend_pnl ?? 0) - (prev?.trend_pnl ?? 0);
+      const totalDelta = (r.total_pnl ?? 0) - (prev?.total_pnl ?? 0);
+      const roundTripsDelta = Math.max(0, (r.round_trips ?? 0) - (prev?.round_trips ?? 0));
+      prev = r;
+      return {
+        date: r.date,
+        grid_profit_delta: round(gridDelta, 6),
+        trend_pnl_delta: round(trendDelta, 6),
+        funding_delta: round(totalDelta - gridDelta - trendDelta, 6),
+        total_pnl_delta: round(totalDelta, 6),
+        equity: r.equity ?? 0,
+        round_trips: roundTripsDelta,
+      };
+    });
+
+    res.json({ botId: id, days, points });
     return;
   }));
 
