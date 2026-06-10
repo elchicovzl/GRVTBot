@@ -3,7 +3,7 @@
 
 import { grvtClient, type GRVTClient, type Balance, getInstrumentSpec } from '../api/client.js';
 import { getGrvtClientForBot, invalidateGrvtClient } from '../api/grvt-client-factory.js';
-import { makerFeeRate, minProfitableSpacing, MIN_SPACING_SAFETY_FACTOR } from './fee-model.js';
+import { makerFeeRate, minProfitableSpacing, roundTripFeeUsdt, MIN_SPACING_SAFETY_FACTOR } from './fee-model.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { childLogger } from '../server/logger.js';
@@ -43,7 +43,19 @@ export interface GridCalculation {
     side: 'buy' | 'sell';
     quantity: number;
   }[];
+  /**
+   * F1.2: NET profit per completed round-trip (gross spread capture
+   * minus the estimated maker round-trip fee). This is the number
+   * users should see everywhere — the gross value alone is inflated.
+   */
   estimatedProfitPerGrid: number;
+  /** Gross spread capture per round-trip: spacing * qty (no fees). */
+  estimatedProfitPerGridGross: number;
+  /**
+   * Estimated maker fee for one full round-trip (buy + sell legs),
+   * computed at the representative mid-of-range price pair.
+   */
+  estimatedFeePerRoundTrip: number;
   liquidationPrice: number;
 }
 
@@ -853,7 +865,12 @@ export class GridEngine extends EventEmitter {
         params_json: JSON.stringify({
           spacing: calculation.spacing,
           quantityPerGrid: calculation.quantityPerGrid,
-          estimatedProfitPerGrid: calculation.estimatedProfitPerGrid
+          // F1.2: estimatedProfitPerGrid is NET of round-trip fees;
+          // gross + fee are stored alongside so any UI can show the
+          // breakdown without recomputing.
+          estimatedProfitPerGrid: calculation.estimatedProfitPerGrid,
+          estimatedProfitPerGridGross: calculation.estimatedProfitPerGridGross,
+          estimatedFeePerRoundTrip: calculation.estimatedFeePerRoundTrip
         })
       });
 
@@ -1738,8 +1755,22 @@ export class GridEngine extends EventEmitter {
 
     log.info(`🧮 Generados ${gridLevels.length} niveles (0 a ${config.numGrids})`);
 
-    // Calcular profit estimado por grid
-    const estimatedProfitPerGrid = spacing * quantityPerGrid;
+    // Calcular profit estimado por grid — NET of fees (F1.2).
+    //
+    // Gross spread capture per round-trip is spacing * qty, but every
+    // round-trip pays maker fees on BOTH legs. Fees vary slightly per
+    // level (they scale with price), so we use the range MIDPOINT as
+    // the representative price pair: buy = mid, sell = mid + spacing.
+    // Levels below mid pay slightly less, levels above slightly more;
+    // the midpoint is the best single-number estimate for the grid.
+    const estimatedProfitPerGridGross = spacing * quantityPerGrid;
+    const estimatedFeePerRoundTrip = roundTripFeeUsdt(
+      midPrice,
+      midPrice + spacing,
+      quantityPerGrid,
+      makerFeeRate()
+    );
+    const estimatedProfitPerGrid = estimatedProfitPerGridGross - estimatedFeePerRoundTrip;
 
     // Calcular liquidation price aproximado (non-fatal si falla)
     let liquidationPrice = 0;
@@ -1760,6 +1791,8 @@ export class GridEngine extends EventEmitter {
       quantityPerGrid,
       gridLevels,
       estimatedProfitPerGrid,
+      estimatedProfitPerGridGross,
+      estimatedFeePerRoundTrip,
       liquidationPrice
     };
   }

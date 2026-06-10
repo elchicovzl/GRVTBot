@@ -870,6 +870,9 @@ function StepConfirm({
         <SummaryItem label={t('wizard.sumSpacing')} value={`${formatUsd(c.spacing)} (${c.spacingPct}%)`} />
         <SummaryItem label={t('wizard.sumQtyPerLevel')} value={formatSize(c.qtyPerLevel)} />
         <SummaryItem label={t('wizard.sumNotional')} value={formatUsd(c.notional)} />
+        {/* F1.2: net = gross − round-trip fee. The fee line explains WHY
+            the net profit is lower than spacing × qty. */}
+        <SummaryItem label={t('wizard.sumFeePerRt')} value={formatPnl(-c.feePerRoundTrip)} />
         <SummaryItem label={t('wizard.sumProfitPerRt')} value={formatPnl(c.profitPerRoundTrip)} />
         <SummaryItem
           label={t('wizard.sumEstLiq')}
