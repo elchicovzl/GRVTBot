@@ -25,6 +25,7 @@ import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
 import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
 import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { computeQtyPerLevel } from '../bot/grid-engine.js';
+import { makerFeeRate, roundTripFeeUsdt } from '../bot/fee-model.js';
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -2020,7 +2021,13 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     // shown qty/profit ~5x for pairs absent from the spec table (e.g. BNB,
     // which falls back to min_notional 5). See grid-engine.computeQtyPerLevel.
     const qtyPerLevel = computeQtyPerLevel(investment, leverage, grids, midPrice, pair);
-    const profitPerRoundTrip = qtyPerLevel * spacing;
+    // F1.2: profit per round-trip shown to the user is NET of fees,
+    // mirroring grid-engine.calculateGridLevels. Fees vary slightly per
+    // level, so the range MIDPOINT is the representative price pair
+    // (buy = mid, sell = mid + spacing) — same convention as the engine.
+    const profitPerRoundTripGross = qtyPerLevel * spacing;
+    const feePerRoundTrip = roundTripFeeUsdt(midPrice, midPrice + spacing, qtyPerLevel, makerFeeRate());
+    const profitPerRoundTrip = profitPerRoundTripGross - feePerRoundTrip;
 
     // Estimated liquidation: simplified — actual depends on funding/fees.
     // For LONG: liq ≈ avg_entry * (1 - 1/leverage * 0.95)
@@ -2044,7 +2051,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         spacingPct: round((spacing / midPrice) * 100, 3),
         qtyPerLevel: round(qtyPerLevel, 6),
         notional: round(notional, 2),
+        // NET of the estimated maker round-trip fee (F1.2).
         profitPerRoundTrip: round(profitPerRoundTrip, 4),
+        profitPerRoundTripGross: round(profitPerRoundTripGross, 4),
+        feePerRoundTrip: round(feePerRoundTrip, 4),
         midPrice: round(midPrice, 2),
         liquidationEstimate: round(liquidationEstimate, 2),
         liqDistancePct: round(liqDistancePct, 2),
@@ -2581,6 +2591,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   // no real orders, no DB writes. Returns profit, drawdown, roundtrips,
   // and an equity curve for charting. Charges per-side fees on every
   // round trip (default 0.05% = 5 bps maker on GRVT).
+  // F3.3 realism: funding (constant per-8h rate — GRVT exposes no
+  // historical funding-rate endpoint), taker fee + slippage on the
+  // initial purchase, and the 80-order-cap active window. All optional
+  // body params below are additive; old payloads behave with defaults.
   interface BacktestBody {
     pair?: string;
     direction?: 'long' | 'short';
@@ -2590,6 +2604,9 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     num_grids?: number;
     investment_usdt?: number;
     fee_pct?: number;
+    slippage_bps?: number;        // taker slippage, default 2 bps
+    funding_rate_per_8h?: number; // decimal, default 0.0001; 0 disables
+    active_window_size?: number;  // default 70 (GRVT 80-order cap)
     interval?: string;
     limit?: number;
   }
@@ -2598,7 +2615,8 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const body = (req.body ?? {}) as BacktestBody;
     const {
       pair, direction, leverage, lower_price, upper_price, num_grids,
-      investment_usdt, fee_pct, interval, limit: candleLimit,
+      investment_usdt, fee_pct, slippage_bps, funding_rate_per_8h,
+      active_window_size, interval, limit: candleLimit,
     } = body;
 
     const errors: string[] = [];
@@ -2611,6 +2629,15 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     if (!Number.isFinite(leverage) || (leverage ?? 0) < 1) errors.push('leverage >= 1');
     if (fee_pct != null && (!Number.isFinite(fee_pct) || fee_pct < 0 || fee_pct > 1)) {
       errors.push('fee_pct in [0, 1]');
+    }
+    if (slippage_bps != null && (!Number.isFinite(slippage_bps) || slippage_bps < 0 || slippage_bps > 100)) {
+      errors.push('slippage_bps in [0, 100]');
+    }
+    if (funding_rate_per_8h != null && (!Number.isFinite(funding_rate_per_8h) || Math.abs(funding_rate_per_8h) > 0.01)) {
+      errors.push('funding_rate_per_8h in [-0.01, 0.01]');
+    }
+    if (active_window_size != null && (!Number.isInteger(active_window_size) || active_window_size < 2 || active_window_size > 80)) {
+      errors.push('active_window_size in [2, 80]');
     }
     if (errors.length) return res.status(400).json({ error: 'validation_failed', errors });
 
@@ -2649,6 +2676,9 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
           numGrids: num_grids!,
           investmentUSDT: investment_usdt!,
           feePct: fee_pct,
+          slippageBps: slippage_bps,
+          fundingRatePer8h: funding_rate_per_8h,
+          activeWindowSize: active_window_size,
         },
         candles
       );
