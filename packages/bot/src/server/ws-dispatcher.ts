@@ -198,6 +198,26 @@ export class WsDispatcher {
       );
     });
 
+    // F2.3: el cierre SL/TP escaló a una MARKET reduce_only (limit estancada
+    // o gap de precio). El ENGINE ya persiste la alerta 'close_escalated'
+    // directamente en la tabla alerts (no duplicar acá) — el dispatcher solo
+    // lo difunde al dashboard para visibilidad en vivo.
+    this.engine.on('closeEscalated', (payload: {
+      botId: number;
+      pair: string;
+      side: 'buy' | 'sell';
+      size: number;
+      refPrice: number;
+      reason: string;
+    }) => {
+      log.warn({ ...payload }, 'close escalated to market order');
+      wsBus.publishToMany(
+        [`bot:${payload.botId}`, 'bots', 'notifications'],
+        'closeEscalated',
+        payload
+      );
+    });
+
     this.engine.on('safeguardTriggered', (payload: {
       botId: number;
       action?: string;

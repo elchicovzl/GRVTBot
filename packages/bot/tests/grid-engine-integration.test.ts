@@ -30,6 +30,11 @@ const { clientHolder, dbHolder, singletonClientProxy, dbProxy } = vi.hoisted(() 
   // Silence pino before grid-engine.ts builds its child logger.
   process.env.LOG_LEVEL = 'silent';
   delete process.env.DRY_RUN;
+  // F2.3: shrink the close-verify poll interval (real setTimeout waits) so
+  // the escalation scenarios — which must exhaust full reprice cycles —
+  // stay well under the 10s test timeout. Read once at module load by
+  // grid-engine.ts's envTunable().
+  process.env.GRVT_CLOSE_POLL_INTERVAL_MS = '40';
 
   const clientHolder: { current: any } = { current: null };
   const dbHolder: { current: any } = { current: null };
@@ -99,6 +104,15 @@ class FakeGrvtClient {
   createOrderErrors: Array<Error | null> = [];
   /** When set, getOpenOrders rejects (simulates GRVT outage). */
   openOrdersError: Error | null = null;
+  /** F2.3: when true, non-post_only LIMIT takers REST instead of filling —
+   *  simulates a fast market / gap where the aggressive limit close chases
+   *  the price and never catches it. MARKET orders still fill (they cross
+   *  the book by definition). */
+  stallLimitTakers = false;
+  /** F2.3: one-shot partial fill applied to the first STALLED limit close —
+   *  models a partial execution before escalation so tests can assert the
+   *  market order is sized to the REMAINING position, not the original. */
+  partialFillOnStall = 0;
 
   orderSeq = 0;
   calls = {
@@ -155,9 +169,15 @@ class FakeGrvtClient {
     // close does (aggressive GTC reduce_only) — without it, closeBot()'s
     // position poll would never see the account flatten. Grid orders are
     // always post_only:true, so they keep resting as before.
-    const px = parseFloat(params.price);
-    const crosses = params.side === 'sell' ? px <= this.price : px >= this.price;
-    if (!params.post_only && crosses) {
+    //
+    // F2.3: MARKET orders always cross. stallLimitTakers makes limit takers
+    // rest (fast-market simulation) — market orders are unaffected.
+    const isMarket = params.type === 'market';
+    const px = isMarket ? this.price : parseFloat(params.price);
+    const crosses = isMarket || (params.side === 'sell' ? px <= this.price : px >= this.price);
+    const stalled = this.stallLimitTakers && !isMarket;
+
+    if (!params.post_only && crosses && !stalled) {
       const pos = this.positions.find((p) => p.instrument === params.instrument);
       if (pos) {
         const delta = parseFloat(params.size) * (params.side === 'sell' ? -1 : 1);
@@ -169,6 +189,22 @@ class FakeGrvtClient {
         }
       }
       return { order_id, metadata: params.metadata }; // filled, never rests
+    }
+
+    // F2.3: one-shot PARTIAL execution of a stalled limit close — the
+    // remainder rests on the book like the real exchange would.
+    if (stalled && crosses && this.partialFillOnStall > 0) {
+      const pos = this.positions.find((p) => p.instrument === params.instrument);
+      if (pos) {
+        const delta = this.partialFillOnStall * (params.side === 'sell' ? -1 : 1);
+        pos.size = String(parseFloat(pos.size) + delta);
+      }
+      this.partialFillOnStall = 0;
+    }
+
+    if (isMarket) {
+      // IOC market that found no position to reduce: never rests.
+      return { order_id, metadata: params.metadata };
     }
 
     this.openOrders.push({
@@ -227,6 +263,8 @@ class FakeDb {
   /** fills_archive rows: { bot_id, fill_id, event_time(ns string), is_buyer, price, size, fee } */
   archiveFills: any[] = [];
   updateBotCalls: Array<{ id: number; updates: any }> = [];
+  /** F2.3: alerts table rows recorded via recordAlert (close_escalated audit). */
+  alerts: any[] = [];
   private nextLevelId = 1;
 
   addBot(bot: any) { this.bots.set(bot.id, { ...bot }); }
@@ -311,6 +349,12 @@ class FakeDb {
   // implementation's fail-safe. Without this method the TypeError would be
   // eaten by updatePnL's catch and silently disable the SL/TP safeguard.
   async getNetFundingForBot(_botId: number) { return 0; }
+
+  // F2.3: closeBot() audits market escalations in the alerts table.
+  async recordAlert(params: any) {
+    this.alerts.push({ ...params });
+    return this.alerts.length;
+  }
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────────
@@ -613,6 +657,195 @@ describe('monitorAllBots(): SAFEGUARD triggers', () => {
     expect(events).toHaveLength(1);
     expect(events[0].action).toBe('pause_close');
     expect(events[0].reason).toContain('SL triggered');
+  });
+});
+
+// ── 4.5 SL/TP market-order escalation (F2.3) ─────────────────────────
+
+describe('closeBot(): SL/TP market-order escalation (F2.3)', () => {
+  /** SL-triggered bot: sl_pct=10 on $1000 investment, PnL -$150 → 15% loss. */
+  function seedSlBot(db: FakeDb, client: FakeGrvtClient, botOverrides: Record<string, any> = {}) {
+    const bot = makeBot({ sl_pct: 10, position_size: 0.5, avg_entry_price: 2000, ...botOverrides });
+    db.addBot(bot);
+    seedGrid(db, bot, 2000);
+    client.price = 2000;
+    coverGrid(client, db, bot.id); // fully covered → no order churn before the PnL check
+    client.positions = [
+      { instrument: PAIR, size: '0.5', unrealized_pnl: '-150', entry_price: '2000' },
+    ];
+    return bot;
+  }
+
+  it('normal market: aggressive limit close fills — NO escalation, no market order, no alert', async () => {
+    const { db, client } = setupWorld();
+    seedSlBot(db, client);
+
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const escalations: any[] = [];
+    engine.on('closeEscalated', (e) => escalations.push(e));
+
+    await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
+
+    // Default path unchanged: ONE aggressive GTC limit close, position flat.
+    const closes = client.calls.createOrder;
+    expect(closes).toHaveLength(1);
+    expect(closes[0]).toMatchObject({ side: 'sell', size: '0.5', type: 'limit', time_in_force: 'gtc', reduce_only: true });
+    // No market order, no escalation event, no audit alert.
+    expect(closes.some((o) => o.type === 'market')).toBe(false);
+    expect(escalations).toHaveLength(0);
+    expect(db.alerts).toHaveLength(0);
+    expect(db.bots.get(1).status).toBe('stopped');
+  });
+
+  it('stalled limit: escalates after the first failed reprice cycle — market is reduce_only, sized to the REMAINING position, bot stopped, close_escalated alert recorded', async () => {
+    const { db, client } = setupWorld();
+    seedSlBot(db, client);
+    // Fast market: the aggressive limit close rests instead of filling, but
+    // executes a 0.2 partial before stalling → remaining position is 0.3.
+    client.stallLimitTakers = true;
+    client.partialFillOnStall = 0.2;
+
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const escalations: any[] = [];
+    engine.on('closeEscalated', (e) => escalations.push(e));
+
+    await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
+
+    // Phase 1: exactly ONE limit attempt (the first reprice cycle), then
+    // escalation — no limit chase across all 4 reprice retries.
+    const limitCloses = client.calls.createOrder.filter((o) => o.type === 'limit');
+    expect(limitCloses).toHaveLength(1);
+    expect(limitCloses[0]).toMatchObject({ side: 'sell', size: '0.5', time_in_force: 'gtc' });
+
+    // Phase 2: market escalation — reduce_only, IOC, sized to the REMAINING
+    // 0.3 (live position re-read AFTER the 0.2 partial), not the original 0.5.
+    const marketCloses = client.calls.createOrder.filter((o) => o.type === 'market');
+    expect(marketCloses).toHaveLength(1);
+    expect(marketCloses[0]).toMatchObject({
+      side: 'sell',
+      size: '0.3',
+      time_in_force: 'ioc',
+      reduce_only: true,
+    });
+
+    // The stalled limit was cancelled BEFORE the market went out (no stacking).
+    expect(client.calls.cancelOrder.length).toBeGreaterThanOrEqual(1);
+
+    // End state: flat, stopped, audited.
+    expect(client.positions).toHaveLength(0);
+    expect(db.bots.get(1).status).toBe('stopped');
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toMatchObject({ botId: 1, side: 'sell', size: 0.3 });
+    const alert = db.alerts.find((a) => a.type === 'close_escalated');
+    expect(alert).toBeDefined();
+    expect(alert).toMatchObject({ user_id: 1, bot_id: 1, severity: 'info' });
+    expect(alert.message).toContain('MARKET sell 0.3');
+  });
+
+  it('gap >2% at SL trigger: limit phase skipped entirely — straight to market', async () => {
+    const { db, client } = setupWorld();
+    // Healthy first tick: small loss (5% < sl 10%) at $2000 seeds the
+    // previous-tick price for gap detection.
+    seedSlBot(db, client);
+    client.positions = [
+      { instrument: PAIR, size: '0.5', unrealized_pnl: '-50', entry_price: '2000' },
+    ];
+
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const escalations: any[] = [];
+    const safeguards: any[] = [];
+    engine.on('closeEscalated', (e) => escalations.push(e));
+    engine.on('safeguardTriggered', (e) => safeguards.push(e));
+
+    await (engine as any).monitorAllBots(); // tick 1: no SL, records $2000
+    expect(db.bots.get(1).status).toBe('running');
+
+    // Tick 2: price gaps down 5% (>2% threshold) and SL crosses. Stall limit
+    // takers so that, if the limit phase ran by mistake, it would be visible.
+    client.price = 1900;
+    client.positions = [
+      { instrument: PAIR, size: '0.5', unrealized_pnl: '-150', entry_price: '2000' },
+    ];
+    client.stallLimitTakers = true;
+
+    await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
+
+    // The SAFEGUARD throw carried the gap token for the fast-path routing.
+    expect(safeguards).toHaveLength(1);
+    expect(safeguards[0].reason).toMatch(/SL triggered.*:gap=5\.00%/);
+
+    // NO limit close was ever attempted — straight to market.
+    expect(client.calls.createOrder.filter((o) => o.type === 'limit')).toHaveLength(0);
+    const marketCloses = client.calls.createOrder.filter((o) => o.type === 'market');
+    expect(marketCloses).toHaveLength(1);
+    expect(marketCloses[0]).toMatchObject({ side: 'sell', size: '0.5', time_in_force: 'ioc', reduce_only: true });
+
+    expect(client.positions).toHaveLength(0);
+    expect(db.bots.get(1).status).toBe('stopped');
+    expect(escalations).toHaveLength(1);
+    const alert = db.alerts.find((a) => a.type === 'close_escalated');
+    expect(alert).toBeDefined();
+    expect(alert.message).toContain('gap fast-path');
+  });
+
+  it('close_escalation=0 (opt-out): identical to the legacy verified close — full reprice retries, fail-closed pause, never a market order', async () => {
+    const { db, client } = setupWorld();
+    seedSlBot(db, client, { close_escalation: 0 });
+    client.stallLimitTakers = true; // limit closes never fill
+
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const escalations: any[] = [];
+    const closeFailures: any[] = [];
+    engine.on('closeEscalated', (e) => escalations.push(e));
+    engine.on('botCloseFailed', (e) => closeFailures.push(e));
+
+    // closeBot() throws fail-closed inside the safeguard handler — contained.
+    await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
+
+    // Legacy behavior: all 4 reprice attempts (1 + CLOSE_MAX_REPRICE_RETRIES),
+    // every one a GTC limit, ZERO market orders, no escalation, no alert.
+    const closes = client.calls.createOrder;
+    expect(closes).toHaveLength(4);
+    expect(closes.every((o) => o.type === 'limit' && o.time_in_force === 'gtc' && o.reduce_only === true)).toBe(true);
+    expect(escalations).toHaveLength(0);
+    expect(db.alerts.filter((a) => a.type === 'close_escalated')).toHaveLength(0);
+
+    // Fail-closed: 'paused' (NOT stopped/deletable), residual persisted,
+    // botCloseFailed emitted with the legacy reason.
+    expect(db.bots.get(1).status).toBe('paused');
+    expect(db.bots.get(1).position_size).toBeCloseTo(0.5);
+    expect(closeFailures).toHaveLength(1);
+    expect(closeFailures[0].reason).toContain('4 close attempts');
+  });
+
+  it('market order itself fails: fail-closed pause preserved (never silently gives up), escalation still audited', async () => {
+    const { db, client } = setupWorld();
+    seedSlBot(db, client);
+    client.stallLimitTakers = true;
+    // 1st createOrder = limit close (succeeds, rests). 2nd = market escalation → rejected.
+    client.createOrderErrors = [null, new Error('HTTP 500: GRVT matching engine unavailable')];
+
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const closeFailures: any[] = [];
+    engine.on('botCloseFailed', (e) => closeFailures.push(e));
+
+    await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
+
+    // Escalation fired and was audited even though the market order failed.
+    expect(client.calls.createOrder.filter((o) => o.type === 'market')).toHaveLength(1);
+    expect(db.alerts.filter((a) => a.type === 'close_escalated')).toHaveLength(1);
+
+    // Fail-closed invariant preserved: paused with the REAL residual, not
+    // stopped, and the failure surfaced via botCloseFailed.
+    expect(db.bots.get(1).status).toBe('paused');
+    expect(db.bots.get(1).position_size).toBeCloseTo(0.5);
+    expect(closeFailures).toHaveLength(1);
+    expect(closeFailures[0].reason).toContain('market escalation');
   });
 });
 

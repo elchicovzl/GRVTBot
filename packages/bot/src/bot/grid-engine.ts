@@ -374,6 +374,13 @@ const LEVERAGE_CHECK_ENABLED = true;
 // integer leverage; a small epsilon absorbs float parse noise (e.g. "10.0").
 const LEVERAGE_MATCH_EPSILON = 0.01;
 
+// Tunables env-overridable (mismo patrón que GRVT_WAL_CHECKPOINT_MB). Definido
+// acá arriba porque los bloques de constantes de cierre/backfill lo usan.
+const envTunable = (name: string, fallback: number): number => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+};
+
 // ── CLOSE FLATTEN-VERIFY SAFEGUARD (DINERO REAL) ────────────────────────
 // createOrder() en GRVT devuelve "aceptada", NO "ejecutada". Antes de marcar
 // el bot como 'stopped' (y por ende eliminable, lo que dispara CASCADE y
@@ -388,9 +395,10 @@ const CLOSE_VERIFY_ENABLED = true;
 const CLOSE_MAX_REPRICE_RETRIES = 3;
 // Cuántas veces hacemos poll de la posición tras cada (re)colocación antes de
 // re-precificar. Total de polls ≈ (RETRIES+1) * POLLS_PER_ATTEMPT.
-const CLOSE_POLLS_PER_ATTEMPT = 6;
+// Env-tunable para que los tests de integración acorten los waits reales.
+const CLOSE_POLLS_PER_ATTEMPT = envTunable('GRVT_CLOSE_POLLS_PER_ATTEMPT', 6);
 // Espera entre polls de posición (ms). 6 polls * 500ms = ~3s por intento.
-const CLOSE_POLL_INTERVAL_MS = 500;
+const CLOSE_POLL_INTERVAL_MS = envTunable('GRVT_CLOSE_POLL_INTERVAL_MS', 500);
 // Agresividad base del precio de cierre (0.5% peor que mark, igual que el
 // comportamiento previo) y el incremento por cada re-precificación.
 const CLOSE_PRICE_AGGRESSION_PCT = 0.005;
@@ -407,6 +415,33 @@ const CLOSE_ORDER_ID_RESOLVE_WAIT_MS = 1000;
 // en open_orders cuando resolvemos un 0x00. El precio de cierre se floorea a 2
 // decimales, así que 1.0 es holgado y suficiente para identificarla unívocamente.
 const CLOSE_ORDER_ID_PRICE_MATCH_TOL = 1.0;
+
+// ── SL/TP MARKET-ORDER ESCALATION (DINERO REAL) ─────────────────────────
+// Un stop-loss que se ejecuta con un LIMIT agresivo re-precificado falla
+// EXACTAMENTE en el escenario para el que existe: mercado rápido / gap. Cada
+// re-precio persigue el precio mientras la posición sangra más allá del SL
+// configurado. Escalación (default ON, opt-out por bot via close_escalation):
+//   1. TIME-BOUNDED: si el cierre limit no flateó tras el PRIMER ciclo de
+//      re-precio fallido — o tras CLOSE_ESCALATION_AFTER_MS, lo que ocurra
+//      primero — cancelamos la limit y mandamos una MARKET IOC reduce_only
+//      por el tamaño REMANENTE (re-leído de GRVT, nunca el tamaño viejo).
+//   2. GAP FAST-PATH: si el precio se movió más de CLOSE_GAP_THRESHOLD_PCT
+//      desde el tick anterior del monitor cuando disparó el SL/TP, salteamos
+//      la fase limit por completo — el gap ES el escenario donde las limit
+//      fallan. monitorAllBots parsea el token ':gap=' del SAFEGUARD throw.
+//   3. FAIL-CLOSED PRESERVADO: si incluso la market falla / no flatea, cae
+//      al mismo path fail-closed de siempre (bot 'paused', residual real en
+//      DB, botCloseFailed + alerta) — jamás nos rendimos en silencio.
+// Cada escalación queda auditada en la tabla alerts ('close_escalated',
+// severidad info) para que el usuario pueda revisar eventos de slippage.
+// Ventana máxima de la fase limit antes de escalar a market (ms). El primer
+// ciclo de re-precio (~3s con los defaults) suele ganar; este tope cubre el
+// caso de polls lentos o intervalos agrandados por env.
+const CLOSE_ESCALATION_AFTER_MS = envTunable('GRVT_CLOSE_ESCALATION_AFTER_MS', 10_000);
+// Movimiento de precio entre ticks consecutivos del monitor (%) que se
+// considera "gap": al disparar SL/TP con un gap mayor a esto, el cierre va
+// directo a market sin intentar la fase limit.
+const CLOSE_GAP_THRESHOLD_PCT = envTunable('GRVT_GAP_THRESHOLD_PCT', 2);
 
 // ── INITIAL-PURCHASE / NAKED-SHORT SAFEGUARD (DINERO REAL) ──────────────────
 // En un grid LONG, la compra inicial (IOC) debe dejar inventario suficiente
@@ -493,11 +528,8 @@ const INSUFFICIENT_MARGIN_RE = /insufficient.*margin|margin.*insufficient|cross.
 // se compara la posición viva de GRVT contra la implicada por el grid y se
 // emite una alerta 'position_drift' si divergen — NUNCA se auto-tradea para
 // corregir el residuo (alert + log; pausar sería demasiado agresivo).
-// Tunables env-overridable (mismo patrón que GRVT_WAL_CHECKPOINT_MB).
-const envTunable = (name: string, fallback: number): number => {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) && v > 0 ? v : fallback;
-};
+// Tunables env-overridable via envTunable() (definido arriba, junto a los
+// safeguards de cierre).
 // Tope del lookback del backfill cuando el bot no tiene fills archivados
 // (arranque en frío): nunca paginamos más atrás que esto ni que el
 // created_at del bot. 7 días default.
@@ -1374,8 +1406,14 @@ export class GridEngine extends EventEmitter {
 
   /**
    * Cerrar bot (cancelar órdenes + cerrar posición)
+   *
+   * opts.escalateImmediately: gap fast-path — el SL/TP disparó con un
+   * movimiento de precio > CLOSE_GAP_THRESHOLD_PCT desde el tick anterior
+   * del monitor, así que la fase limit se saltea por completo y el cierre
+   * va directo a MARKET reduce_only (las limit fallan exactamente en gaps).
+   * Solo aplica si el bot tiene close_escalation habilitado (default sí).
    */
-  async closeBot(botId: number): Promise<void> {
+  async closeBot(botId: number, opts: { escalateImmediately?: boolean } = {}): Promise<void> {
     try {
       const bot = await db.getBot(botId);
       if (!bot) throw new Error(`Bot ${botId} no encontrado`);
@@ -1446,11 +1484,36 @@ export class GridEngine extends EventEmitter {
       // confirmar que quedó plana. Si no flatea, re-precificamos (cancel-
       // before-replace) hasta un máximo acotado. NUNCA stackeamos órdenes de
       // cierre duplicadas: cancelamos la GTC vieja antes de re-colocar.
+      //
+      // ESCALACIÓN A MARKET (default ON, opt-out por bot via close_escalation):
+      // si la fase limit no flatea dentro de la ventana acotada (primer ciclo
+      // de re-precio fallido o CLOSE_ESCALATION_AFTER_MS), o si llegamos acá
+      // por el gap fast-path (opts.escalateImmediately), cerramos el REMANENTE
+      // con una MARKET IOC reduce_only. Con close_escalation=0 el comporta-
+      // miento es EXACTAMENTE el cierre verificado previo (re-precios + fail-
+      // closed), para usuarios que prefieren control de slippage.
+      const escalationEnabled = (bot.close_escalation ?? 1) !== 0;
+      const skipLimitPhase = escalationEnabled && opts.escalateImmediately === true;
+      let escalate = skipLimitPhase;
+
       let lastCloseOrderId: string | null = null;
       let finalSize = realPositionSize; // se re-fetchea en cada poll
       let flattened = false;
+      const closeStart = Date.now();
 
-      for (let attempt = 0; attempt <= CLOSE_MAX_REPRICE_RETRIES && !flattened; attempt++) {
+      if (skipLimitPhase) {
+        log.warn(`⚡ Bot ${botId}: gap >${CLOSE_GAP_THRESHOLD_PCT}% al disparar SL/TP — fase limit salteada, cierre directo a MARKET`);
+      }
+
+      for (let attempt = 0; attempt <= CLOSE_MAX_REPRICE_RETRIES && !flattened && !escalate; attempt++) {
+        // ESCALACIÓN TIME-BOUNDED: el intento 0 siempre corre (elapsed≈0);
+        // si su ciclo completo de polls no flateó — o si la fase limit ya
+        // consumió CLOSE_ESCALATION_AFTER_MS — escalamos en vez de seguir
+        // persiguiendo el precio con re-precios.
+        if (escalationEnabled && (attempt >= 1 || Date.now() - closeStart >= CLOSE_ESCALATION_AFTER_MS)) {
+          escalate = true;
+          break;
+        }
         // Re-consultar posición antes de re-colocar: pudo haber flateado
         // mientras esperábamos, o un fill parcial cambió el tamaño/lado.
         const curPos = (await client.getPositions()).find(p => p.instrument === bot.pair);
@@ -1559,6 +1622,104 @@ export class GridEngine extends EventEmitter {
         }
       }
 
+      // ── ESCALACIÓN A MARKET (DINERO REAL) ────────────────────────────
+      // La fase limit no flateó dentro de la ventana (o se salteó por gap).
+      // Invariantes de seguridad:
+      //   - reduce_only SIEMPRE: la escalación jamás puede flipear la posición.
+      //   - tamaño = REMANENTE re-leído de GRVT justo antes de mandar la
+      //     market (un fill parcial de la fase limit reduce la market).
+      //   - cancelar la limit viva ANTES de la market (no stackear cierres).
+      //   - si la market falla o no flatea → MISMO path fail-closed de abajo
+      //     (paused + residual real + botCloseFailed); nunca silencio.
+      if (!flattened && escalate) {
+        // 1. Cancelar cualquier orden de cierre limit que siga viva.
+        if (lastCloseOrderId) {
+          try { await client.cancelOrder(lastCloseOrderId, bot.pair); } catch { /* ya fileada/cancelada */ }
+          lastCloseOrderId = null;
+        } else if (!skipLimitPhase) {
+          // La fase limit corrió pero el order_id no se resolvió (0x00):
+          // barrer el par para que la limit huérfana no compita con la market.
+          try {
+            await client.cancelAllOrders(bot.pair);
+          } catch (e) {
+            log.warn(`No se pudo cancelAllOrders antes de la escalación a market: ${(e as Error).message}`);
+          }
+        }
+
+        // 2. Re-leer la posición VIVA — autoritativa para el tamaño remanente.
+        const livePos = (await client.getPositions()).find(p => p.instrument === bot.pair);
+        finalSize = livePos ? parseFloat(livePos.size) : 0;
+        if (Math.abs(finalSize) <= dustEpsilon) {
+          flattened = true; // flateó mientras cancelábamos — nada que escalar
+        } else {
+          const closeSide = finalSize > 0 ? 'sell' : 'buy';
+          const closeSize = Math.floor(Math.abs(finalSize) * 100) / 100;
+          const ticker = await client.getTicker(bot.pair);
+          const refPrice = parseFloat(ticker.last_price);
+
+          const escalationReason = skipLimitPhase
+            ? `gap fast-path: price moved >${CLOSE_GAP_THRESHOLD_PCT}% since previous monitor tick at SL/TP trigger`
+            : `limit close stalled: position not flat after first reprice cycle (bounded window ${CLOSE_ESCALATION_AFTER_MS}ms)`;
+          log.warn(`⚡ Bot ${botId}: ESCALANDO cierre a MARKET ${closeSide} ${closeSize} ${bot.pair} (ref $${refPrice}) — ${escalationReason}`);
+
+          // 3. Auditoría: alerta info ANTES de mandar la market, así el evento
+          // de escalación queda registrado aunque la market misma falle (el
+          // fail-closed de abajo lo cubre además con 'close_failed' crítico).
+          // Fire-safe: la auditoría jamás puede romper el path de cierre.
+          try {
+            await db.recordAlert({
+              user_id: bot.user_id ?? 1,
+              bot_id: botId,
+              type: 'close_escalated',
+              severity: 'info',
+              message: `Close escalated to MARKET ${closeSide} ${closeSize} ${bot.pair} @ ref $${refPrice} — ${escalationReason}`,
+            });
+          } catch (alertErr) {
+            log.warn(`No se pudo registrar la alerta close_escalated: ${(alertErr as Error).message}`);
+          }
+          this.emit('closeEscalated', {
+            botId,
+            pair: bot.pair,
+            side: closeSide,
+            size: closeSize,
+            refPrice,
+            reason: escalationReason,
+          });
+
+          // 4. MARKET IOC reduce_only por el remanente. price = referencia
+          // para la validación de min_notional del cliente; NO se envía a
+          // GRVT (is_market=true firma limitPrice=0 y omite limit_price).
+          let marketSent = false;
+          try {
+            await client.createOrder({
+              sub_account_id: client.subAccountId,
+              instrument: bot.pair,
+              size: closeSize.toString(),
+              price: refPrice.toString(),
+              side: closeSide,
+              type: 'market',
+              time_in_force: 'ioc',
+              reduce_only: true, // la escalación JAMÁS puede abrir/flipear
+            }, true);
+            marketSent = true;
+            log.info(`✅ Orden MARKET de escalación enviada: ${closeSide} ${closeSize} ${bot.pair} (IOC, reduce_only)`);
+          } catch (mktErr) {
+            log.error(`❌ Bot ${botId}: la orden MARKET de escalación falló: ${(mktErr as Error).message} — cayendo al path fail-closed`);
+          }
+
+          // 5. Verificar el flatten igual que la fase limit. Si la market no
+          // se pudo mandar, no hay nada que esperar: directo al fail-closed.
+          if (marketSent) {
+            for (let poll = 0; poll < CLOSE_POLLS_PER_ATTEMPT && !flattened; poll++) {
+              await new Promise((r) => setTimeout(r, CLOSE_POLL_INTERVAL_MS));
+              const pollPos = (await client.getPositions()).find(p => p.instrument === bot.pair);
+              finalSize = pollPos ? parseFloat(pollPos.size) : 0;
+              if (Math.abs(finalSize) <= dustEpsilon) flattened = true;
+            }
+          }
+        }
+      }
+
       if (flattened) {
         // Cancelar cualquier remanente de la orden de cierre por las dudas.
         if (lastCloseOrderId) {
@@ -1581,9 +1742,14 @@ export class GridEngine extends EventEmitter {
       // NOTA: el schema de DB sólo permite status IN ('paused','running',
       // 'stopped'); usamos 'paused' como estado fail-closed en vez de un nuevo
       // 'closing'/'error' para no requerir una migración de CHECK constraint.
+      // Con escalación, el resumen de intentos refleja limit + market; sin
+      // escalación (opt-out), el wording legacy de N intentos de re-precio.
+      const attemptsDesc = escalate
+        ? 'fase limit + escalación MARKET'
+        : `${CLOSE_MAX_REPRICE_RETRIES + 1} intentos`;
       await db.updateBot(botId, { status: 'paused', position_size: finalSize });
       log.error(
-        `🚨 Bot ${botId}: NO se pudo flatear la posición tras ${CLOSE_MAX_REPRICE_RETRIES + 1} intentos. ` +
+        `🚨 Bot ${botId}: NO se pudo flatear la posición tras ${attemptsDesc}. ` +
         `Residual=${finalSize} ${bot.pair}. Bot dejado en 'paused' (fail-closed); orden de cierre GTC sigue viva (id=${lastCloseOrderId ?? 'n/d'}). ` +
         `Eliminación bloqueada hasta cerrar la posición.`
       );
@@ -1592,10 +1758,12 @@ export class GridEngine extends EventEmitter {
         residualSize: finalSize,
         pair: bot.pair,
         closeOrderId: lastCloseOrderId,
-        reason: `position not flat after ${CLOSE_MAX_REPRICE_RETRIES + 1} close attempts`,
+        reason: escalate
+          ? 'position not flat after limit close + market escalation'
+          : `position not flat after ${CLOSE_MAX_REPRICE_RETRIES + 1} close attempts`,
       });
       throw new Error(
-        `Cierre no confirmado para bot ${botId}: posición residual ${finalSize} ${bot.pair} tras ${CLOSE_MAX_REPRICE_RETRIES + 1} intentos. ` +
+        `Cierre no confirmado para bot ${botId}: posición residual ${finalSize} ${bot.pair} tras ${attemptsDesc}. ` +
         `Bot dejado en 'paused'; orden de cierre GTC sigue viva. Revisá GRVT manualmente.`
       );
 
@@ -1690,7 +1858,12 @@ export class GridEngine extends EventEmitter {
           log.info(`🚨 SAFEGUARD activado para bot ${botId} — acción: ${action}`);
           try {
             if (action === 'pause_close') {
-              await this.closeBot(botId);
+              // GAP FAST-PATH: updatePnL() anota ':gap=N%' en el SAFEGUARD
+              // throw cuando el precio se movió más de CLOSE_GAP_THRESHOLD_PCT
+              // desde el tick anterior. En ese escenario las limit agresivas
+              // fallan por construcción — el cierre va directo a MARKET.
+              const gapDetected = /:gap=[\d.]+%/.test(error.message);
+              await this.closeBot(botId, { escalateImmediately: gapDetected });
             } else {
               await this.pauseBot(botId);
             }
@@ -2953,6 +3126,14 @@ export class GridBotInstance {
   private cachedBalanceAt = 0;
   private marginCheckCounter = 0;
 
+  // Escalación de cierres: precio del tick ANTERIOR del monitor y el gap %
+  // contra el tick actual. updatePnL() anota ':gap=N%' en el SAFEGUARD throw
+  // de SL/TP cuando lastTickGapPct >= CLOSE_GAP_THRESHOLD_PCT, y
+  // monitorAllBots() rutea ese token a closeBot({escalateImmediately:true})
+  // — un gap al disparar el SL ES el escenario donde la fase limit falla.
+  private lastTickPrice: number | null = null;
+  private lastTickGapPct = 0;
+
   constructor(bot: GridBot, client?: GRVTClient) {
     this.bot = bot;
     this.injectedClient = client ?? null;
@@ -3947,6 +4128,15 @@ export class GridBotInstance {
     const ticker = await this.grvt.getTicker(this.bot.pair);
     const currentPrice = parseFloat(ticker.last_price);
 
+    // 2.1. Gap detection para la escalación de cierres: % de movimiento
+    // contra el tick anterior. Se computa ANTES de los safeguards para que
+    // un SL/TP disparado en ESTE tick ya conozca el gap. Primer tick (o
+    // resume) → sin referencia → gap 0 (sin fast-path, comportamiento normal).
+    this.lastTickGapPct = this.lastTickPrice != null && this.lastTickPrice > 0
+      ? (Math.abs(currentPrice - this.lastTickPrice) / this.lastTickPrice) * 100
+      : 0;
+    this.lastTickPrice = currentPrice;
+
     // 2.5. SAFEGUARD: liquidation proximity check (C.4). Opt-in per bot.
     // Throws a SAFEGUARD:<action>: error that monitorAllBots() parses to
     // decide whether to pause or pause+close. No-op when the bot has no
@@ -4767,11 +4957,19 @@ export class GridBotInstance {
       // H.3: Stop-loss / take-profit check (after PnL is persisted).
       // Uses the same SAFEGUARD throw pattern as C.4 — monitorAllBots()
       // catches it and routes to closeBot().
+      //
+      // GAP FAST-PATH: si el precio se movió más de CLOSE_GAP_THRESHOLD_PCT
+      // desde el tick anterior del monitor, anotamos ':gap=N%' al final del
+      // mensaje — monitorAllBots lo parsea y saltea la fase limit del cierre
+      // (directo a MARKET). El gap ES el escenario donde las limit fallan.
+      const gapSuffix = this.lastTickGapPct >= CLOSE_GAP_THRESHOLD_PCT
+        ? `:gap=${this.lastTickGapPct.toFixed(2)}%`
+        : '';
       if (this.bot.sl_pct != null && this.bot.investment_usdt > 0) {
         const lossPct = (totalPnl / this.bot.investment_usdt) * -100;
         if (totalPnl < 0 && lossPct >= this.bot.sl_pct) {
           throw new Error(
-            `SAFEGUARD:pause_close:bot=${this.bot.id}:SL triggered at -${lossPct.toFixed(1)}% (threshold ${this.bot.sl_pct}%)`
+            `SAFEGUARD:pause_close:bot=${this.bot.id}:SL triggered at -${lossPct.toFixed(1)}% (threshold ${this.bot.sl_pct}%)${gapSuffix}`
           );
         }
       }
@@ -4779,7 +4977,7 @@ export class GridBotInstance {
         const gainPct = (totalPnl / this.bot.investment_usdt) * 100;
         if (totalPnl > 0 && gainPct >= this.bot.tp_pct) {
           throw new Error(
-            `SAFEGUARD:pause_close:bot=${this.bot.id}:TP triggered at +${gainPct.toFixed(1)}% (threshold ${this.bot.tp_pct}%)`
+            `SAFEGUARD:pause_close:bot=${this.bot.id}:TP triggered at +${gainPct.toFixed(1)}% (threshold ${this.bot.tp_pct}%)${gapSuffix}`
           );
         }
       }

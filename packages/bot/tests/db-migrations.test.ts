@@ -67,6 +67,7 @@ describe('GridBotDB migrations (D.6)', () => {
       'last_compound_at', 'total_reinvested',
       'safeguard_enabled', 'safeguard_threshold_pct', 'safeguard_action',
       'sl_pct', 'tp_pct',
+      'close_escalation',
       'auto_shift_enabled', 'auto_shift_pct', 'last_auto_shift_at',
       'virtual_enabled', 'active_window_size',
     ]) {

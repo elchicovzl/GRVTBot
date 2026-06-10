@@ -620,11 +620,23 @@ export class GRVTClient {
       throw new Error('SAFEGUARD: Solo se permiten órdenes LIMIT (usar allowMarket=true para casos especiales)');
     }
 
-    // SAFEGUARD: Validar min_size y min_notional
-    this.validateOrderSize(request.instrument, request.size, request.price!);
+    // Market orders (escalación de cierre SL/TP): el signer ya soportaba
+    // isMarket/timeInForce pero este método nunca los pasaba — toda orden
+    // se firmaba como LIMIT GTC aunque request.type fuese 'market'. Ahora
+    // is_market=true se firma con limitPrice=0 (parte del typed-data EIP-712)
+    // y el payload omite limit_price. request.price queda como precio de
+    // REFERENCIA para la validación de min_notional (no se envía a GRVT).
+    const isMarket = request.type === 'market';
+    // Mapeo time_in_force → uint8 de la firma EIP-712: GTC=1, IOC=3.
+    // Las market van IOC (GRVT no acepta market resting); default legacy GTC.
+    const timeInForce = request.time_in_force === 'ioc' ? 3 : 1;
 
-    console.log(`📝 Creando orden: ${request.side} ${request.size} ${request.instrument} @ ${request.price}`);
-    
+    // SAFEGUARD: Validar min_size y min_notional (tick_size solo para limit:
+    // el precio de una market es referencia, no viaja en la orden).
+    this.validateOrderSize(request.instrument, request.size, request.price, isMarket);
+
+    console.log(`📝 Creando orden: ${request.side} ${request.size} ${request.instrument} @ ${isMarket ? 'MARKET' : request.price}`);
+
     try {
       // Firmar orden con EIP-712 — pass per-instance signing creds
       // so multi-tenant clients each sign with their own private key.
@@ -633,7 +645,9 @@ export class GRVTClient {
         instrument: request.instrument,
         side: request.side,
         size: request.size,
-        price: request.price!,
+        price: request.price,
+        isMarket,
+        timeInForce,
         postOnly: request.post_only || false,
         reduceOnly: request.reduce_only || false,
       }, {
@@ -647,7 +661,7 @@ export class GRVTClient {
         signedOrder,
         request.instrument,
         request.size,
-        request.price!,
+        request.price,
         request.side
       );
 
@@ -919,12 +933,15 @@ export class GRVTClient {
   // === VALIDACIONES Y SAFEGUARDS ===
 
   /**
-   * Validar tamaño de orden según specs de instrumento
+   * Validar tamaño de orden según specs de instrumento.
+   *
+   * Para market orders (isMarket=true) el precio es de REFERENCIA (se usa
+   * para el chequeo de min_notional pero no viaja a GRVT), así que el
+   * chequeo de tick_size no aplica. Limit orders mantienen la validación
+   * completa y siguen requiriendo precio.
    */
-  private validateOrderSize(instrument: string, size: string, price: string): void {
+  private validateOrderSize(instrument: string, size: string, price: string | undefined, isMarket: boolean = false): void {
     const sizeNum = parseFloat(size);
-    const priceNum = parseFloat(price);
-    const notional = sizeNum * priceNum;
 
     // H.1: dynamic specs from cache (populated by getInstruments, fallback hardcoded)
     const specs = getInstrumentSpec(instrument);
@@ -933,16 +950,32 @@ export class GRVTClient {
       throw new Error(`Tamaño ${size} menor que min_size ${specs.min_size} para ${instrument}`);
     }
 
+    if (price == null || price === '') {
+      if (!isMarket) {
+        throw new Error(`Precio requerido para órdenes limit en ${instrument}`);
+      }
+      // Market sin precio de referencia: no podemos validar notional acá;
+      // GRVT lo rechazará si viola min_notional (la escalación de cierre
+      // siempre pasa el ticker como referencia, así que no llega acá).
+      return;
+    }
+
+    const priceNum = parseFloat(price);
+    const notional = sizeNum * priceNum;
+
     if (notional < specs.min_notional) {
       throw new Error(`Notional $${notional.toFixed(2)} menor que min_notional $${specs.min_notional} para ${instrument}`);
     }
 
-    // Validar tick size usando aritmética más precisa
-    const rounded = Math.round(priceNum / specs.tick_size) * specs.tick_size;
-    const diff = Math.abs(priceNum - rounded);
-    const tolerance = specs.tick_size / 1000;
-    if (diff >= tolerance) {
-      throw new Error(`Precio ${price} no es múltiplo de tick_size ${specs.tick_size} para ${instrument} (diff: ${diff})`);
+    // Validar tick size usando aritmética más precisa (solo limit: el precio
+    // de una market es referencia y no se envía).
+    if (!isMarket) {
+      const rounded = Math.round(priceNum / specs.tick_size) * specs.tick_size;
+      const diff = Math.abs(priceNum - rounded);
+      const tolerance = specs.tick_size / 1000;
+      if (diff >= tolerance) {
+        throw new Error(`Precio ${price} no es múltiplo de tick_size ${specs.tick_size} para ${instrument} (diff: ${diff})`);
+      }
     }
   }
 
