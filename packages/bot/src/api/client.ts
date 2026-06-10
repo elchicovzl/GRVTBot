@@ -92,6 +92,11 @@ export interface CreateOrderRequest {
   type: 'limit' | 'market';
   time_in_force?: 'gtc' | 'ioc' | 'fok';
   post_only?: boolean;
+  // SAFEGUARD anti naked-short: cuando true, GRVT solo deja que la orden
+  // reduzca/cierre la posición existente; nunca abre ni aumenta. Lo usamos
+  // en los SELL de toma de ganancia del grid LONG para que un sell jamás
+  // pueda abrir un short por construcción.
+  reduce_only?: boolean;
   metadata?: string;
 }
 
@@ -475,6 +480,7 @@ export class GRVTClient {
         size: request.size,
         price: request.price!,
         postOnly: request.post_only || false,
+        reduceOnly: request.reduce_only || false,
       }, {
         privateKey: sc.privateKey,
         signerAddress: sc.signerAddress,
@@ -517,7 +523,13 @@ export class GRVTClient {
       } as Order;
 
     } catch (error) {
-      console.error('❌ Error creando orden firmada:', error);
+      // El error de authedRequest es `HTTP <status>: <errorText>` con el BODY
+      // CRUDO de GRVT. El engine matchea ese texto para detectar rechazos de
+      // margen insuficiente (INSUFFICIENT_MARGIN_RE en grid-engine) y frenar el
+      // grid, así que NO lo envolvemos ni lo aplanamos: re-lanzamos tal cual
+      // para preservar la signature de GRVT. Logueamos el body completo para
+      // poder confirmar la signature real de "cross margin insufficient".
+      console.error('❌ Error creando orden firmada (GRVT body crudo):', error instanceof Error ? error.message : error);
       throw error;
     }
   }
@@ -575,9 +587,9 @@ export class GRVTClient {
    */
   async setLeverage(instrument: string, leverage: number): Promise<boolean> {
     await rateLimiter.waitIfNeeded();
-    
+
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
-    
+
     try {
       await this.authedRequest(`${TRADING_URL}/set_leverage`, {
         sub_account_id: this.tradingAccountId,
@@ -586,9 +598,48 @@ export class GRVTClient {
       });
       return true;
     } catch (error) {
-      console.error(`Error estableciendo leverage:`, error);
+      // ⚠️ DINERO REAL: GRVT puede rechazar el set_leverage (p.ej. posición
+      // abierta, margin insuficiente, tier inválido). El caller usa el bool
+      // para fallar-cerrado, pero SIN el cuerpo del error el operador no sabe
+      // POR QUÉ rechazó. Logueamos el error completo (no sólo .message) para
+      // diagnóstico. El tipo de retorno se mantiene boolean por compat.
+      console.error(
+        `Error estableciendo leverage ${leverage}x para ${instrument}:`,
+        error instanceof Error ? error.message : error,
+        error
+      );
       return false;
     }
+  }
+
+  /**
+   * Leer el leverage REALMENTE aplicado por GRVT para un instrumento desde
+   * account_summary.positions[]. GRVT sólo expone el leverage por
+   * instrumento cuando hay una posición abierta; si no hay posición devuelve
+   * null (no es un error, simplemente no hay nada que leer todavía).
+   *
+   * Se usa para read-back tras setLeverage: el leverage es "sticky" en GRVT,
+   * así que tras un set_leverage rechazado el bot operaría al leverage previo
+   * mientras la DB muestra el nuevo. Esta lectura permite fallar-cerrado.
+   */
+  async getAppliedLeverage(instrument: string): Promise<number | null> {
+    await rateLimiter.waitIfNeeded();
+
+    const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
+      sub_account_id: this.tradingAccountId
+    });
+
+    if (data.positions && Array.isArray(data.positions)) {
+      const pos = data.positions.find((p: any) => p.instrument === instrument);
+      if (pos && pos.leverage != null) {
+        const lev = parseFloat(pos.leverage);
+        return Number.isFinite(lev) ? lev : null;
+      }
+    }
+    // No hay posición para este instrumento → GRVT no expone el leverage
+    // aplicado pre-posición. El caller decide qué hacer (verificar tras el
+    // primer fill / en resume).
+    return null;
   }
 
   /**
@@ -666,13 +717,19 @@ export class GRVTClient {
       });
       
       const fundingPayments: FundingPayment[] = [];
-      
+
       // Extraer funding de cada posición
       if (data.positions && Array.isArray(data.positions)) {
         for (const position of data.positions) {
           if (position.cumulative_realized_funding_payment !== undefined) {
+            // ⚠️ DINERO REAL: cumulative_realized_funding_payment es un TOTAL
+            // ACUMULADO por posición (ya en USDT, NO en raw/1e6), con SIGNO:
+            // negativo = funding PAGADO (costo), positivo = funding RECIBIDO.
+            // NO usar Math.abs — eso convertía funding recibido en costo y
+            // multiplicaba la pérdida. El caller (pollFundingHistory) lo trata
+            // como snapshot acumulado, NO como un evento per-poll.
             const fundingAmount = parseFloat(position.cumulative_realized_funding_payment || '0');
-            
+
             // Filtrar por instrumento si se especifica
             if (!instrument || position.instrument === instrument) {
               fundingPayments.push({
@@ -686,11 +743,13 @@ export class GRVTClient {
                 // 739 rows in production were corrupted by this; backfilled
                 // via SQL on deploy. New rows now correctly stamp seconds.
                 funding_time: Math.floor(Date.now() / 1000),
-                payment: Math.abs(fundingAmount).toString(), // Valor absoluto
+                // SIGNO PRESERVADO (ver nota arriba): este es el cumulative
+                // acumulado con signo, no un valor absoluto per-evento.
+                payment: fundingAmount.toString(),
                 position_size: position.size || '0'
               });
-              
-              console.log(`📡 [DEBUG] Funding for ${position.instrument}: ${fundingAmount} USDT`);
+
+              console.log(`📡 [DEBUG] Funding acumulado for ${position.instrument}: ${fundingAmount} USDT (con signo)`);
             }
           }
         }

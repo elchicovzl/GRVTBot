@@ -12,7 +12,8 @@ import path from 'path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'url';
 import { createServer } from 'node:http';
-import { grvtClient } from '../api/client.js';
+import { grvtClient, getInstrumentSpec } from '../api/client.js';
+import { getGrvtClientForBot } from '../api/grvt-client-factory.js';
 import { db } from '../database/db.js';
 import { gridEngine } from '../bot/grid-engine.js';
 import { getAuthStatus, authenticatedRequest } from '../api/auth.js';
@@ -553,11 +554,49 @@ app.post('/api/bots/:id/delete', async (req, res) => {
     
     // SAFEGUARD: Solo permitir eliminación si el bot está detenido
     if (bot.status !== 'stopped') {
-      return res.status(400).json({ 
-        error: 'Solo se pueden eliminar bots en estado STOPPED. Pausá el bot antes de eliminarlo.' 
+      return res.status(400).json({
+        error: 'Solo se pueden eliminar bots en estado STOPPED. Pausá el bot antes de eliminarlo.'
       });
     }
-    
+
+    // SAFEGUARD (DINERO REAL): rechazar eliminación si todavía hay posición.
+    // deleteBot dispara CASCADE; borrar un bot con exposición abierta la
+    // dejaría huérfana en GRVT sin nadie que la gestione. Tratamos un residual
+    // <= min_size del instrumento como polvo (plano).
+    const { min_size: minSize } = getInstrumentSpec(bot.pair);
+
+    // 1) Pre-filtro RÁPIDO con la DB (barato, sin red).
+    if (Math.abs(bot.position_size ?? 0) > minSize) {
+      return res.status(400).json({
+        error: `No se puede eliminar: el bot todavía tiene posición abierta (${bot.position_size} ${bot.pair}). Cerrá la posición en GRVT antes de eliminarlo.`
+      });
+    }
+
+    // 2) Chequeo AUTORITATIVO contra GRVT (DINERO REAL).
+    // bot.position_size puede estar desactualizado: un fill/reversión parcial
+    // posterior puede dejar exposición REAL viva mientras la DB muestra 0 +
+    // status 'stopped'. Si dejáramos pasar el delete, el CASCADE huérfanaría
+    // esa posición en GRVT. Re-leemos la posición VIVA del sub-account del
+    // DUEÑO del bot (multi-tenant) — mismo patrón que el endpoint de leverage.
+    // FAIL-CLOSED: si no podemos leer la posición viva, RECHAZAMOS el delete.
+    try {
+      const ownerClient = bot.user_id != null
+        ? await getGrvtClientForBot(bot.user_id, bot.grvt_sub_account_id ?? null, db)
+        : grvtClient;
+      const livePosition = await ownerClient.getPosition(bot.pair);
+      const liveSize = livePosition ? parseFloat(livePosition.size) : 0;
+      if (Math.abs(liveSize) > minSize) {
+        return res.status(400).json({
+          error: `No se puede eliminar: GRVT reporta posición abierta (${liveSize} ${bot.pair}) aunque la DB muestre 0. Cerrá la posición en GRVT antes de eliminarlo.`
+        });
+      }
+    } catch (liveErr) {
+      console.error(`🗑️ No se pudo verificar la posición viva en GRVT para bot ${botId}:`, liveErr);
+      return res.status(400).json({
+        error: `No se puede eliminar: no se pudo verificar la posición viva en GRVT (${liveErr instanceof Error ? liveErr.message : 'error desconocido'}). Por seguridad (dinero real), reintentá; si persiste, verificá manualmente que no haya posición abierta en GRVT.`
+      });
+    }
+
     console.log(`🗑️ [DEBUG] Eliminando bot ${botId} (status: ${bot.status})...`);
     
     // Eliminar bot de la database (CASCADE eliminará grid_levels, orders, trades, etc.)
@@ -591,19 +630,36 @@ app.post('/api/bots/:id/leverage', async (req, res) => {
       return res.status(404).json({ error: 'Bot not found' });
     }
 
-    // Update leverage in GRVT
-    await grvtClient.setLeverage(bot.pair, leverage);
-    
-    // Update in database
+    // ⚠️ DINERO REAL: resolver el cliente del DUEÑO del bot (multi-tenant).
+    // El singleton grvtClient apunta al sub-account del operador via env, así
+    // que tocaría la cuenta equivocada. Si el bot no tiene user_id (legacy),
+    // cae al singleton.
+    const client = bot.user_id != null
+      ? await getGrvtClientForBot(bot.user_id, bot.grvt_sub_account_id ?? null, db)
+      : grvtClient;
+
+    // FAIL-CLOSED: sólo escribimos la DB y devolvemos success si GRVT
+    // CONFIRMÓ el set_leverage. Si rechazó, devolvemos 502 y NO tocamos la DB
+    // (de lo contrario la DB/dashboard mostrarían un leverage que GRVT nunca
+    // aplicó y el bot operaría al leverage previo).
+    const ok = await client.setLeverage(bot.pair, leverage);
+    if (!ok) {
+      console.error(`⚡ GRVT rechazó set_leverage para bot ${botId} -> ${leverage}x (DB no modificada)`);
+      return res.status(502).json({
+        error: `GRVT rechazó el cambio de leverage a ${leverage}x. La DB no fue modificada. Revisá los logs del servidor para el motivo.`
+      });
+    }
+
+    // Update in database (sólo tras confirmación de GRVT)
     await db.updateBot(botId, { leverage });
-    
+
     console.log(`⚡ Leverage actualizado via dashboard: Bot ${botId} -> ${leverage}x`);
-    
-    res.json({ 
-      success: true, 
-      message: `Leverage actualizado a ${leverage}x` 
+
+    res.json({
+      success: true,
+      message: `Leverage actualizado a ${leverage}x`
     });
-    
+
   } catch (error) {
     console.error('Error updating leverage:', error);
     res.status(400).json({ error: error instanceof Error ? error.message : "Unknown error" });
@@ -810,12 +866,18 @@ app.get('/api/bots/:id/trades', async (req, res) => {
   }
 });
 
-// Get bot funding history
+// Get bot funding (snapshot model — DINERO REAL)
+// ⚠️ Lee funding_snapshots (NO el viejo funding_history). El engine ya NO escribe
+// funding_history; escribe un snapshot acumulado por (bot, instrumento). Las
+// filas viejas de funding_history quedaron congeladas y corruptas (÷1e6 ≈ $0,
+// multi-contadas, Math.abs'd) y divergían del NET corregido del PnL. El total
+// autoritativo es db.getNetFundingForBot (SUM(carried_net + latest - baseline)).
 app.get('/api/bots/:id/funding', async (req, res) => {
   try {
     const botId = parseInt(req.params.id);
-    const funding = await db.getFundingHistoryByBot(botId);
-    res.json(funding);
+    const funding = await db.getFundingSnapshotsByBot(botId);
+    const netFundingUsdt = await db.getNetFundingForBot(botId);
+    res.json({ funding, netFundingUsdt });
   } catch (error) {
     console.error('Error fetching bot funding:', error);
     res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
@@ -1202,10 +1264,13 @@ async function calculateRealPnL(botId: number): Promise<{
     const totalFees = trades.reduce((sum, trade) => sum + trade.fee, 0);
     console.log(`💰 [DEBUG] Bot ${botId} fees totales: ${totalFees}`);
 
-    // 2. Calcular funding totales 
-    const fundingHistory = await db.getFundingHistoryByBot(botId);
-    const totalFunding = fundingHistory.reduce((sum, funding) => sum + Math.abs(funding.payment_usdt), 0);
-    console.log(`💰 [DEBUG] Bot ${botId} funding total: ${totalFunding}`);
+    // 2. Calcular funding NETO con SIGNO desde funding_snapshots (DINERO REAL).
+    // ⚠️ FIX: antes esto sumaba Math.abs(payment_usdt) sobre funding_history
+    // (filas /1e6 ≈ $0 + cumulative multi-contado + signo eliminado por abs),
+    // tratando funding RECIBIDO como costo. Ahora leemos el NETO con signo
+    // (negativo = pagado neto, positivo = recibido neto) del modelo de snapshot.
+    const netFunding = await db.getNetFundingForBot(botId);
+    console.log(`💰 [DEBUG] Bot ${botId} funding NETO (con signo): ${netFunding}`);
 
     // 3. Get ALL PnL data directly from GRVT account_summary (source of truth)
     let gridProfitNet = 0;
@@ -1304,8 +1369,12 @@ async function calculateRealPnL(botId: number): Promise<{
       trendPnLGross = bot.trend_pnl_usdt || 0;
     }
     
-    const trendPnLNet = trendPnLGross - totalFunding;
-    console.log(`💰 [DEBUG] Bot ${botId} trend PnL bruto: ${trendPnLGross}, neto: ${trendPnLNet}`);
+    // ⚠️ FIX: SUMAMOS el funding NETO con signo (negativo = pagado → baja el
+    // PnL; positivo = recibido → lo sube). Antes restaba un Math.abs, lo que
+    // convertía funding recibido en costo y, peor, multiplicaba el costo por el
+    // cumulative multi-contado de funding_history.
+    const trendPnLNet = trendPnLGross + netFunding;
+    console.log(`💰 [DEBUG] Bot ${botId} trend PnL bruto: ${trendPnLGross}, neto (con funding): ${trendPnLNet}`);
 
     // 5. Total PnL = Grid Profit + Trend PnL (ambos ya netos)
     const totalPnLNet = gridProfitNet + trendPnLNet;
@@ -1317,7 +1386,7 @@ async function calculateRealPnL(botId: number): Promise<{
       trendPnL: trendPnLNet,
       totalPnL: totalPnLNet,
       totalFees: totalFees,
-      totalFunding: totalFunding
+      totalFunding: netFunding // NETO con signo (el campo conserva su nombre público)
     };
 
   } catch (error) {

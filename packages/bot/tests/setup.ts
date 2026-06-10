@@ -50,6 +50,8 @@ beforeAll(() => {
   process.env.GRVT_API_SECRET = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
   process.env.GRVT_TRADING_ADDRESS = '0xAbCdEf0123456789AbCdEf0123456789AbCdEf01';
   process.env.GRVT_TRADING_ACCOUNT_ID = '1';
+  // JWT secret for signToken()/getSecret() (auth/jwt.ts) — needs >= 32 chars or it throws
+  process.env.JWT_SECRET = 'test-jwt-secret-at-least-32-chars-long-xxxxx';
 });
 
 afterEach(() => {

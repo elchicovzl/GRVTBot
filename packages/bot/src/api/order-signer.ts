@@ -131,6 +131,7 @@ export interface OrderParams {
   isMarket?: boolean; // Nuevo: para market orders
   timeInForce?: number; // Nuevo: 1=GTC, 3=IOC
   postOnly?: boolean; // true = maker only, orden se cancela si haría taker
+  reduceOnly?: boolean; // true = la orden SOLO puede reducir/cerrar posición, nunca abrir/aumentar (anti naked-short)
   leverage?: number; // No usado directamente en la firma, pero útil para logging
 }
 
@@ -176,7 +177,7 @@ export async function signOrder(
   params: OrderParams,
   signingCreds?: SigningCreds
 ): Promise<SignedOrder> {
-  const { instrument, side, size, price, isMarket = false, timeInForce = 1, postOnly: postOnlyParam = false } = params;
+  const { instrument, side, size, price, isMarket = false, timeInForce = 1, postOnly: postOnlyParam = false, reduceOnly: reduceOnlyParam = false } = params;
 
   // Validar que tengamos configuración para el instrumento (dinámica via getInstrumentSpec)
   const assetIdCheck = getAssetId(instrument);
@@ -216,7 +217,7 @@ export async function signOrder(
     isMarket: isMarket,
     timeInForce: timeInForce, // 1=GTC, 3=IOC
     postOnly: postOnlyParam,
-    reduceOnly: false,
+    reduceOnly: reduceOnlyParam, // anti naked-short: la firma DEBE cubrir el flag real (forma parte del typed-data EIP-712)
     legs: [
       {
         assetID,
