@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { createV2Router, type V2RouterDeps } from '../src/server/v2-router.js';
+import { makerFeeRate, roundTripFeeUsdt } from '../src/bot/fee-model.js';
 
 // ── Mock deps ────────────────────────────────────────────────────────
 // The router takes injected deps — we provide fakes that return
@@ -301,6 +302,57 @@ describe('POST /api/v2/bots/:id/range — F1.1 refusal propagation', () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('range_update_refused');
     expect(res.body.message).toContain('minimum profitable spacing');
+  });
+});
+
+describe('POST /api/v2/bots/validate — F1.2 net profit per round-trip', () => {
+  const payload = {
+    pair: 'ETH_USDT_Perp',
+    direction: 'long' as const,
+    lower_price: 1800,
+    upper_price: 2400,
+    num_grids: 10,
+    investment_usdt: 500,
+    leverage: 2,
+  };
+
+  it('returns net profit, gross profit, and fee per round-trip', async () => {
+    const { app } = createTestApp();
+    const res = await request(app)
+      .post('/api/v2/bots/validate')
+      .set('X-Api-Key', API_KEY)
+      .send(payload);
+
+    expect(res.status).toBe(200);
+    const c = res.body.computed;
+
+    expect(c.feePerRoundTrip).toBeGreaterThan(0);
+    expect(c.profitPerRoundTripGross).toBeCloseTo(c.qtyPerLevel * c.spacing, 3);
+    // The headline number is NET: gross minus the round-trip maker fee.
+    expect(c.profitPerRoundTrip).toBeCloseTo(
+      c.profitPerRoundTripGross - c.feePerRoundTrip,
+      3
+    );
+    expect(c.profitPerRoundTrip).toBeLessThan(c.profitPerRoundTripGross);
+  });
+
+  it('fee matches the shared fee model at the mid-of-range price pair', async () => {
+    const { app } = createTestApp();
+    const res = await request(app)
+      .post('/api/v2/bots/validate')
+      .set('X-Api-Key', API_KEY)
+      .send(payload);
+
+    expect(res.status).toBe(200);
+    const c = res.body.computed;
+    // buy = mid, sell = mid + spacing — same convention as grid-engine.
+    const expectedFee = roundTripFeeUsdt(
+      c.midPrice,
+      c.midPrice + c.spacing,
+      c.qtyPerLevel,
+      makerFeeRate()
+    );
+    expect(c.feePerRoundTrip).toBeCloseTo(expectedFee, 3);
   });
 });
 

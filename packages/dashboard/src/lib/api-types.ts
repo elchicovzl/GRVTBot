@@ -303,7 +303,12 @@ export interface ValidateBotResult {
     spacingPct: number;
     qtyPerLevel: number;
     notional: number;
+    /** NET of the estimated maker round-trip fee (F1.2). */
     profitPerRoundTrip: number;
+    /** Gross spread capture (spacing * qty), no fees deducted. */
+    profitPerRoundTripGross: number;
+    /** Estimated maker fee for one full round-trip (buy + sell legs). */
+    feePerRoundTrip: number;
     midPrice: number;
     liquidationEstimate: number;
     liqDistancePct: number;
