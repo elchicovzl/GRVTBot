@@ -481,6 +481,47 @@ const MAX_NOTIONAL_SAFETY_FACTOR = 1.5;
 // confirmarse contra un rechazo real (ver flagged en el resumen).
 const INSUFFICIENT_MARGIN_RE = /insufficient.*margin|margin.*insufficient|cross.?margin.*(insufficient|balance)/i;
 
+// ── FILL BACKFILL / POSITION RECONCILIATION (DINERO REAL) ───────────────────
+// La detección de fills en vivo depende de (a) getFillHistory REST con una
+// ventana de ~90s y (b) el archivo respaldado por WS que sólo captura fills
+// mientras hay conexión. Si el bot pierde conectividad (o está caído) >90s,
+// los fills de ese hueco se vuelven indetectables: el nivel nunca flipea, la
+// counter-order nunca se coloca y la posición se acumula sin hedge. El
+// backfill cierra ese hueco: pagina fill_history desde el último fill
+// archivado, inserta idempotente (INSERT OR IGNORE) y procesa cada fill NUEVO
+// por el MISMO camino que usa el monitor (handleLevelFill). Tras el backfill
+// se compara la posición viva de GRVT contra la implicada por el grid y se
+// emite una alerta 'position_drift' si divergen — NUNCA se auto-tradea para
+// corregir el residuo (alert + log; pausar sería demasiado agresivo).
+// Tunables env-overridable (mismo patrón que GRVT_WAL_CHECKPOINT_MB).
+const envTunable = (name: string, fallback: number): number => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+};
+// Tope del lookback del backfill cuando el bot no tiene fills archivados
+// (arranque en frío): nunca paginamos más atrás que esto ni que el
+// created_at del bot. 7 días default.
+const BACKFILL_LOOKBACK_CAP_MS = envTunable(
+  'GRVT_BACKFILL_LOOKBACK_CAP_MS',
+  7 * 24 * 60 * 60 * 1000
+);
+// Hueco entre ticks EXITOSOS del monitor que dispara un backfill antes del
+// siguiente procesamiento normal de fills. Alineado con la ventana REST de
+// ~90s que usa la detección en vivo: un hueco mayor implica fills que la
+// detección normal ya no puede ver.
+const BACKFILL_GAP_TRIGGER_MS = envTunable('GRVT_BACKFILL_GAP_TRIGGER_MS', 90_000);
+// Tope de páginas de getFillHistory por backfill. GRVT capea cada respuesta
+// (~430 fills aunque limit=1000) y puede ignorar end_time silenciosamente
+// (el loop detecta el stall), así que el cap evita girar para siempre.
+const BACKFILL_MAX_BATCHES = envTunable('GRVT_BACKFILL_MAX_BATCHES', 20);
+// Tolerancia de drift de posición como fracción del qty mínimo por nivel
+// (default: medio nivel). Si |posición GRVT - posición implicada por el
+// grid| supera tolerancia tras el backfill, se emite 'position_drift'.
+const POSITION_DRIFT_TOLERANCE_FACTOR = envTunable(
+  'GRVT_POSITION_DRIFT_TOLERANCE_FACTOR',
+  0.5
+);
+
 /**
  * Local estimate of liquidation price for the safeguard check. Uses the
  * bot's current avg_entry_price (updated on every fill) and leverage,
@@ -525,6 +566,15 @@ export class GridEngine extends EventEmitter {
   // any bot in this set so it cannot race with the mutation, place
   // duplicate orders, or read inconsistent grid_levels mid-transaction.
   private bumpInProgress = new Set<number>();
+
+  // Backfill: timestamp (ms) of the last SUCCESSFUL monitor() tick per
+  // bot. monitorAllBots() compares the gap between successful ticks
+  // against BACKFILL_GAP_TRIGGER_MS — a gap longer than the REST fill
+  // lookback (~90s) means live detection may have missed fills, so a
+  // backfill runs BEFORE the next normal fill processing. Seeded by
+  // resumeBotInstance() (which runs its own backfill) and cleared on
+  // pause so a long pause is not misread as a connectivity gap.
+  private lastMonitorSuccess = new Map<number, number>();
 
   /**
    * Register an async task started from an interval/timeout so stop()
@@ -1267,6 +1317,26 @@ export class GridEngine extends EventEmitter {
     log.info(
       `✅ Bot ${bot.id} resumed: ${instance.getActiveOrderCount()} órdenes mapeadas a grid levels`
     );
+
+    // ── BACKFILL MISSED FILLS (restart/resume) ──────────────────────────
+    // Rebinding by price restores the ORDER map but says nothing about
+    // fills that happened while the process was down: the filled level's
+    // order is simply gone from GRVT, the level never flips, the
+    // counter-order is never placed and the position stays unhedged.
+    // Recover them now, through the same pipeline the live monitor uses,
+    // then sanity-check the live position against the grid-implied one.
+    // Non-fatal: a failed backfill must not abort the resume (orders are
+    // already rebound); the gap trigger in monitorAllBots retries.
+    try {
+      await this.backfillFills(bot.id);
+    } catch (err) {
+      log.warn(
+        `⚠️ Bot ${bot.id}: resume backfill failed (gap trigger will retry): ${(err as Error).message}`
+      );
+    }
+    // Seed the tick watermark so the first monitor tick after resume
+    // doesn't immediately re-trigger the gap backfill we just ran.
+    this.lastMonitorSuccess.set(bot.id, Date.now());
   }
 
   /**
@@ -1286,6 +1356,10 @@ export class GridEngine extends EventEmitter {
         await instance.cancelAllOrders();
         this.bots.delete(botId);
       }
+      // A paused bot is not "disconnected" — drop the tick watermark so
+      // a later resume doesn't misread the pause as a connectivity gap
+      // (resume runs its own backfill anyway).
+      this.lastMonitorSuccess.delete(botId);
 
       await db.updateBot(botId, { status: 'paused' });
       
@@ -1579,11 +1653,31 @@ export class GridEngine extends EventEmitter {
       if (this.bumpInProgress.has(botId)) {
         continue;
       }
+      // Backfill on detected connectivity gap: if the last SUCCESSFUL
+      // monitor tick is older than the live fill-detection lookback
+      // (~90s), any fill inside the gap is invisible to the normal
+      // REST/archive checks — recover it BEFORE the tick so monitor()
+      // sees the level already flipped instead of "re-placing" over a
+      // missed fill. Non-fatal: a failed backfill must not block the
+      // tick (it retries on the next gap detection).
+      const lastSuccess = this.lastMonitorSuccess.get(botId);
+      if (lastSuccess != null && Date.now() - lastSuccess > BACKFILL_GAP_TRIGGER_MS) {
+        const gapSec = ((Date.now() - lastSuccess) / 1000).toFixed(0);
+        log.warn(
+          `🕳️ Bot ${botId}: ${gapSec}s gap since last successful monitor tick (>${BACKFILL_GAP_TRIGGER_MS / 1000}s) — running fill backfill before this tick`
+        );
+        try {
+          await this.backfillFills(botId);
+        } catch (err) {
+          log.warn(`⚠️ Bot ${botId}: gap backfill failed (will retry on next gap): ${(err as Error).message}`);
+        }
+      }
       // G.5: lightweight per-bot tick timing for /metrics. The finally
       // block records the duration whether monitor() succeeded or threw.
       const tickStart = Date.now();
       try {
         await instance.monitor();
+        this.lastMonitorSuccess.set(botId, Date.now());
       } catch (error) {
         // G.5: classified error counter (safeguard/margin/api_timeout/…)
         botMetrics.recordError(botId, classifyMonitorError(error));
@@ -2601,6 +2695,220 @@ export class GridEngine extends EventEmitter {
         `📥 Fill archive [${label}]: +${c.added} new (fee sum ${c.feeSum.toFixed(6)} USDT, ${c.feeSum < 0 ? 'rebate earned' : 'fees paid'})`
       );
     }
+  }
+
+  /**
+   * Backfill + reconciliation for ONE bot: recover fills that the live
+   * detection (REST ~90s lookback + WS-backed archive) could not see
+   * because the process was down or disconnected.
+   *
+   *   1. Watermark: last archived fill event_time for THIS bot
+   *      (fills_archive). Fallback: bot creation time, capped at
+   *      BACKFILL_LOOKBACK_CAP_MS back (default 7 days).
+   *   2. Page getFillHistory backwards (end_time cursor, same loop shape
+   *      as the admin backfill route) until we cross the watermark, GRVT
+   *      returns nothing, the loop stalls (GRVT ignoring end_time), or
+   *      BACKFILL_MAX_BATCHES is hit. The per-user rate limiter + 429
+   *      backoff live client-side (readWithBackoff).
+   *   3. Insert everything via the idempotent archive insert (INSERT OR
+   *      IGNORE on fill_id) and count what was actually NEW.
+   *   4. Route each NEW fill through the SAME pipeline the live monitor
+   *      uses (processBackfilledFill → handleLevelFill): level flip +
+   *      counter-order. No second processing fork.
+   *   5. Position sanity check: live GRVT position vs the grid-implied
+   *      expectation. Divergence beyond tolerance → loud log + emit
+   *      'position_drift' (alerts table via ws-dispatcher). NO
+   *      auto-trading to "fix" the residual — alert only.
+   *
+   * Returns a summary for callers/tests; null when the bot isn't
+   * registered in the engine (no instance → nothing to reconcile).
+   */
+  async backfillFills(botId: number): Promise<{
+    scanned: number;
+    inserted: number;
+    processed: number;
+    drift: boolean;
+  } | null> {
+    const instance = this.bots.get(botId);
+    if (!instance) return null;
+    const bot = instance.getBot();
+    const instrument = bot.pair;
+    if (!instrument) return null;
+
+    const client = await this.getClientForBot(bot);
+
+    // ── 1. Watermark (ns) ────────────────────────────────────────────
+    const nowMs = Date.now();
+    const capNs = BigInt(Math.max(0, nowMs - BACKFILL_LOOKBACK_CAP_MS)) * 1_000_000n;
+    let sinceNs = capNs;
+    const lastArchived = await db.getLatestFillEventTimeForBot(botId);
+    if (lastArchived) {
+      const lastNs = BigInt(lastArchived);
+      sinceNs = lastNs > capNs ? lastNs : capNs;
+    } else {
+      const createdMs = Date.parse(bot.created_at ?? '');
+      if (Number.isFinite(createdMs)) {
+        const createdNs = BigInt(createdMs) * 1_000_000n;
+        sinceNs = createdNs > capNs ? createdNs : capNs;
+      }
+    }
+
+    // ── 2+3. Page backwards until we cross the watermark ─────────────
+    let scanned = 0;
+    let inserted = 0;
+    const newFills: Array<{ fill_id: string; event_time: string; price: number; size: number; is_buyer: boolean }> = [];
+    let endTime: string | undefined = undefined;
+    let lastOldest: string | null = null;
+
+    for (let batchNo = 0; batchNo < BACKFILL_MAX_BATCHES; batchNo++) {
+      const batch = await client.getFillHistory(1000, instrument, endTime);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+
+      const oldest = batch[batch.length - 1]!;
+      const oldestEventTime = String(oldest.event_time ?? '');
+      // Stall guard: GRVT silently ignoring end_time would replay the
+      // same page forever (inserts are no-ops but the loop would spin).
+      if (!oldestEventTime || (lastOldest !== null && lastOldest === oldestEventTime)) break;
+      lastOldest = oldestEventTime;
+
+      for (const f of batch) {
+        const eventTime = String(f.event_time ?? '');
+        if (!eventTime) continue;
+        // GRVT ignores the `instrument` body field on fill_history and
+        // returns the whole sub-account — filter client-side (same fix
+        // as pollFillArchive, discovered 2026-05-03).
+        if (f.instrument !== instrument) continue;
+        if (BigInt(eventTime) <= sinceNs) continue; // older than watermark
+        scanned++;
+        const wasNew = await db.insertFillArchive({
+          fill_id: eventTime,
+          event_time: eventTime,
+          is_buyer: f.is_buyer ? 1 : 0,
+          price: parseFloat(f.price ?? '0'),
+          size: parseFloat(f.size ?? '0'),
+          fee: parseFloat(f.fee ?? '0'),
+          created_at: new Date(Number(eventTime) / 1_000_000).toISOString(),
+          bot_id: botId,
+          instrument,
+        });
+        if (wasNew) {
+          inserted++;
+          newFills.push({
+            fill_id: eventTime,
+            event_time: eventTime,
+            price: parseFloat(f.price ?? '0'),
+            size: parseFloat(f.size ?? '0'),
+            is_buyer: !!f.is_buyer,
+          });
+        }
+      }
+
+      // Crossed the watermark → every older page is already archived.
+      if (BigInt(oldestEventTime) <= sinceNs) break;
+      // Page strictly older than this batch (GRVT returns newest→oldest).
+      endTime = (BigInt(oldestEventTime) - 1n).toString();
+    }
+
+    // ── 4. Process NEW fills through the live pipeline ───────────────
+    let processed = 0;
+    if (newFills.length > 0) {
+      // Oldest first so a buy→sell sequence flips levels in real order.
+      newFills.sort((a, b) => (BigInt(a.event_time) < BigInt(b.event_time) ? -1 : 1));
+
+      const ticker = await client.getTicker(instrument);
+      const currentPrice = parseFloat(ticker.last_price);
+      const openOrders = await client.getOpenOrders(instrument);
+      const liveOrderPrices: number[] = [];
+      for (const order of openOrders) {
+        const leg = (order as any).legs?.[0];
+        if (leg?.limit_price) liveOrderPrices.push(parseFloat(leg.limit_price));
+      }
+
+      for (const fill of newFills) {
+        const handled = await instance.processBackfilledFill(fill, currentPrice, liveOrderPrices);
+        if (handled) processed++;
+      }
+    }
+
+    if (inserted > 0 || processed > 0) {
+      log.info(
+        `📥 Backfill [bot ${botId} ${instrument}]: scanned ${scanned} fills past watermark, ${inserted} new archived, ${processed} processed (level flip + counter-order)`
+      );
+    }
+
+    // ── 5. Position sanity check (alert only — never auto-trade) ─────
+    const drift = await this.checkPositionDrift(botId, instance, client);
+
+    return { scanned, inserted, processed, drift };
+  }
+
+  /**
+   * Compare GRVT's live position against the grid-implied expectation
+   * and emit a 'position_drift' alert when they diverge beyond
+   * tolerance. NEVER trades to correct the residual — a wrong-sized
+   * "fix" order is worse than a loud alert (pause is too aggressive
+   * here: the grid keeps round-tripping correctly even when carrying a
+   * residual).
+   *
+   * Grid-implied expectation (LONG): every non-filled SELL level is
+   * take-profit inventory the bot must be holding — the initial
+   * purchase buys exactly that sum (executeInitialPurchase), a buy fill
+   * adds qty AND creates a sell level, a sell fill removes qty AND
+   * removes a sell level. The invariant: position == Σ qty over sell
+   * levels not genuinely filled. "Genuinely filled" = is_filled AND
+   * state='filled' (the monitor's natural GAP marks is_filled without
+   * state='filled', and its inventory is still held). SHORT mirrors
+   * with buy levels, negative.
+   */
+  private async checkPositionDrift(
+    botId: number,
+    instance: GridBotInstance,
+    client: GRVTClient
+  ): Promise<boolean> {
+    const bot = instance.getBot();
+    let liveSize = 0;
+    try {
+      const pos = await client.getPosition(bot.pair);
+      liveSize = pos && (pos as any).size ? parseFloat((pos as any).size) : 0;
+    } catch (err) {
+      log.warn(
+        `⚠️ Bot ${botId}: position drift check skipped — getPosition failed: ${(err as Error).message}`
+      );
+      return false;
+    }
+
+    const levels = await db.getGridLevels(botId);
+    const inventorySide = bot.direction === 'short' ? 'buy' : 'sell';
+    let expectedAbs = 0;
+    let minQty = Infinity;
+    for (const l of levels) {
+      if (l.quantity > 0 && l.quantity < minQty) minQty = l.quantity;
+      if (l.side !== inventorySide) continue;
+      if (l.is_filled && l.state === 'filled') continue; // genuinely filled
+      expectedAbs += l.quantity;
+    }
+    const expectedSize = bot.direction === 'short' ? -expectedAbs : expectedAbs;
+    if (!Number.isFinite(minQty)) minQty = bot.quantity_per_level ?? 0;
+    const tolerance = Math.max(minQty * POSITION_DRIFT_TOLERANCE_FACTOR, 1e-9);
+    const drift = Math.abs(liveSize - expectedSize);
+
+    if (drift <= tolerance) return false;
+
+    log.error(
+      `🚨 POSITION DRIFT [bot ${botId} ${bot.pair}]: GRVT live position ${liveSize} vs grid-implied ${expectedSize.toFixed(6)} ` +
+      `(drift ${drift.toFixed(6)} > tolerance ${tolerance.toFixed(6)} = ${POSITION_DRIFT_TOLERANCE_FACTOR}× min level qty ${minQty}). ` +
+      `Likely missed fills outside the backfill window or external trading on the sub-account. ` +
+      `NOT auto-correcting (alert only) — review fills_archive and GRVT history, then flatten/adjust manually if needed.`
+    );
+    this.emit('positionDrift', {
+      botId,
+      pair: bot.pair,
+      liveSize,
+      expectedSize,
+      drift,
+      tolerance,
+    });
+    return true;
   }
 }
 
@@ -3896,95 +4204,182 @@ export class GridBotInstance {
       }
     }
     
-    // 6. For each filled level, place counter-order at SAME price, OPPOSITE side
+    // 6. For each filled level, place counter-order at SAME price, OPPOSITE side.
+    // Shared with backfillFills() via handleLevelFill() — live detection and
+    // backfill MUST run the exact same flip + counter-order pipeline.
     const gridLevelsAll = await db.getGridLevels(this.bot.id);
     for (const level of filledLevels) {
-      // Counter-order goes ONE LEVEL UP (buy filled → sell at level+1) or DOWN (sell filled → buy at level-1)
-      // This captures the ~$7 spread as profit. The filled level stays empty (the "gap").
-      let counterLevelIndex: number;
-      let counterSide: 'buy' | 'sell';
-      
-      if (level.side === 'buy') {
-        counterLevelIndex = level.level_index + 1;
-        counterSide = 'sell';
-      } else {
-        counterLevelIndex = level.level_index - 1;
-        counterSide = 'buy';
-      }
-      
-      const counterLevel = gridLevelsAll.find((l: any) => l.level_index === counterLevelIndex);
-      if (!counterLevel) {
-        log.info(`⚠️ No counter level found for index ${counterLevelIndex}, skipping`);
-        continue;
-      }
-      
-      // ⚠️ CHECK: Si el nivel destino YA tiene orden activa, NO colocar otra (evita duplicados)
-      if (counterLevel.order_id && counterLevel.order_id !== '0x00' && counterLevel.order_id !== '0x0000000000000000000000000000000000000000000000000000000000000000' && !counterLevel.is_filled) {
-        log.info(`⚠️ Counter level ${counterLevelIndex} @ $${counterLevel.price} already has order ${counterLevel.order_id}, skipping duplicate`);
-        // Solo marcar el filled level como filled
-        await db.updateGridLevel(level.id, { is_filled: true });
-        continue;
-      }
-      
-      // Fixed qty: same for ALL levels (calculated from midpoint price)
-      const finalQty = this.getFixedQty();
-
-      // H.8: if counter level is OUTSIDE the active window, don't place an order.
-      // Mark it 'virtual' so rotateVirtualWindow activates it when price approaches.
-      // Also mark the filled level as 'filled' state.
-      if (this.bot.virtual_enabled) {
-        const M = this.bot.active_window_size ?? 70;
-        // Compute the counter level's distance rank against all non-filled levels
-        const nonFilled = gridLevelsAll
-          .filter((l: any) => l.state !== 'filled' && l.id !== level.id)
-          .map((l: any) => ({ id: l.id, dist: Math.abs(l.price - currentPrice) }))
-          .sort((a: any, b: any) => a.dist - b.dist);
-        const insideWindow = nonFilled.slice(0, M).some((l: any) => l.id === counterLevel.id);
-
-        if (!insideWindow) {
-          log.info(`🌫️ Counter level ${counterLevelIndex} @ $${counterLevel.price} outside window — marking virtual`);
-          await db.updateGridLevel(counterLevel.id, {
-            side: counterSide, quantity: finalQty, state: 'virtual', order_id: null, is_filled: false,
-          });
-          await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
-          await new Promise(r => setTimeout(r, 200));
-          continue;
-        }
-      }
-
-      log.info(`🔄 Round-trip: ${level.side} filled @ $${level.price} → placing ${counterSide} ${finalQty} ETH @ $${counterLevel.price} (level ${counterLevelIndex})`);
-
-      try {
-        await this.placeGridOrder({ ...counterLevel, side: counterSide, quantity: finalQty });
-
-        // Mark filled level as filled (it stays empty - the gap)
-        await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
-
-        // Update counter level with new side
-        await db.updateGridLevel(counterLevel.id, {
-          side: counterSide,
-          is_filled: false,
-          state: 'active',
-        });
-      } catch (err: any) {
-        // FRENO DE CROSS-MARGIN (DINERO REAL): el freno debe escalar a
-        // monitorAllBots (pause); NO seguir armando counter-orders sobre una
-        // cuenta exhausta.
-        if (err instanceof Error && err.message?.includes('MARGIN:')) {
-          throw err;
-        }
-        if (err.message?.includes('7201') || err.message?.includes('2090')) {
-          log.info(`⚠️ Skipping level ${counterLevelIndex}: ${err.message}`);
-          await db.updateGridLevel(counterLevel.id, { pending_replace: true });
-        }
-      }
-
-      await new Promise(r => setTimeout(r, 200)); // throttle
+      await this.handleLevelFill(level, currentPrice, gridLevelsAll);
     }
-    
+
     // 7. Update PnL
     await this.updatePnL();
     await this.checkPendingReplaceOrders();
+  }
+
+  /**
+   * SINGLE fill-handling path: flip a filled level and place its
+   * counter-order one level up (buy filled) / down (sell filled).
+   *
+   * Extracted from monitor() step 6 so the backfill reconciliation
+   * (engine.backfillFills) reuses EXACTLY the same pipeline instead of
+   * forking a second one — same duplicate guard, same virtual-window
+   * handling, same MARGIN re-throw, same 7201/2090 pending_replace
+   * routing, same throttle.
+   *
+   * Caller is responsible for fill-level dedup (processedFills) — this
+   * method operates on a LEVEL that is known to have filled.
+   */
+  async handleLevelFill(
+    level: any,
+    currentPrice: number,
+    gridLevelsAll: any[]
+  ): Promise<void> {
+    // Counter-order goes ONE LEVEL UP (buy filled → sell at level+1) or DOWN (sell filled → buy at level-1)
+    // This captures the ~$7 spread as profit. The filled level stays empty (the "gap").
+    let counterLevelIndex: number;
+    let counterSide: 'buy' | 'sell';
+
+    if (level.side === 'buy') {
+      counterLevelIndex = level.level_index + 1;
+      counterSide = 'sell';
+    } else {
+      counterLevelIndex = level.level_index - 1;
+      counterSide = 'buy';
+    }
+
+    const counterLevel = gridLevelsAll.find((l: any) => l.level_index === counterLevelIndex);
+    if (!counterLevel) {
+      log.info(`⚠️ No counter level found for index ${counterLevelIndex}, skipping`);
+      return;
+    }
+
+    // ⚠️ CHECK: Si el nivel destino YA tiene orden activa, NO colocar otra (evita duplicados)
+    if (counterLevel.order_id && counterLevel.order_id !== '0x00' && counterLevel.order_id !== '0x0000000000000000000000000000000000000000000000000000000000000000' && !counterLevel.is_filled) {
+      log.info(`⚠️ Counter level ${counterLevelIndex} @ $${counterLevel.price} already has order ${counterLevel.order_id}, skipping duplicate`);
+      // Solo marcar el filled level como filled
+      await db.updateGridLevel(level.id, { is_filled: true });
+      return;
+    }
+
+    // Fixed qty: same for ALL levels (calculated from midpoint price)
+    const finalQty = this.getFixedQty();
+
+    // H.8: if counter level is OUTSIDE the active window, don't place an order.
+    // Mark it 'virtual' so rotateVirtualWindow activates it when price approaches.
+    // Also mark the filled level as 'filled' state.
+    if (this.bot.virtual_enabled) {
+      const M = this.bot.active_window_size ?? 70;
+      // Compute the counter level's distance rank against all non-filled levels
+      const nonFilled = gridLevelsAll
+        .filter((l: any) => l.state !== 'filled' && l.id !== level.id)
+        .map((l: any) => ({ id: l.id, dist: Math.abs(l.price - currentPrice) }))
+        .sort((a: any, b: any) => a.dist - b.dist);
+      const insideWindow = nonFilled.slice(0, M).some((l: any) => l.id === counterLevel.id);
+
+      if (!insideWindow) {
+        log.info(`🌫️ Counter level ${counterLevelIndex} @ $${counterLevel.price} outside window — marking virtual`);
+        await db.updateGridLevel(counterLevel.id, {
+          side: counterSide, quantity: finalQty, state: 'virtual', order_id: null, is_filled: false,
+        });
+        await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
+        await new Promise(r => setTimeout(r, 200));
+        return;
+      }
+    }
+
+    log.info(`🔄 Round-trip: ${level.side} filled @ $${level.price} → placing ${counterSide} ${finalQty} ETH @ $${counterLevel.price} (level ${counterLevelIndex})`);
+
+    try {
+      await this.placeGridOrder({ ...counterLevel, side: counterSide, quantity: finalQty });
+
+      // Mark filled level as filled (it stays empty - the gap)
+      await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
+
+      // Update counter level with new side
+      await db.updateGridLevel(counterLevel.id, {
+        side: counterSide,
+        is_filled: false,
+        state: 'active',
+      });
+    } catch (err: any) {
+      // FRENO DE CROSS-MARGIN (DINERO REAL): el freno debe escalar a
+      // monitorAllBots (pause); NO seguir armando counter-orders sobre una
+      // cuenta exhausta.
+      if (err instanceof Error && err.message?.includes('MARGIN:')) {
+        throw err;
+      }
+      if (err.message?.includes('7201') || err.message?.includes('2090')) {
+        log.info(`⚠️ Skipping level ${counterLevelIndex}: ${err.message}`);
+        await db.updateGridLevel(counterLevel.id, { pending_replace: true });
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 200)); // throttle
+  }
+
+  /**
+   * Backfill entry point on the instance: route ONE recovered fill
+   * through the same pipeline the live monitor uses.
+   *
+   * Matching rules mirror the monitor's fill detection:
+   *   - price-match the closest NON-FILLED grid level of the fill's side
+   *     (buy fill → buy level) within the grid-step-scaled tolerance;
+   *   - skip if a live GRVT order currently rests at that level's price
+   *     (the level is covered → this fill was already processed and the
+   *     grid has since moved on);
+   *   - dedup by fill_id via the same processedFills set the monitor
+   *     uses, so a fill recovered by backfill is never double-processed
+   *     by a later monitor tick (and vice versa).
+   *
+   * Returns true when the fill flipped a level (counter-order pipeline
+   * ran), false when it was a no-op (already processed / no match).
+   */
+  async processBackfilledFill(
+    fill: { fill_id: string; price: number; size: number; is_buyer: boolean },
+    currentPrice: number,
+    liveOrderPrices: number[]
+  ): Promise<boolean> {
+    if (this.processedFills.has(fill.fill_id)) return false;
+
+    const gridLevels = await db.getGridLevels(this.bot.id);
+    const gridStep = (this.bot.upper_price - this.bot.lower_price) / this.bot.num_grids;
+    // Same shape as the monitor's fill match (<1.0) but scaled down for
+    // tight grids (SOL step=0.25) so a fill can never alias to an
+    // adjacent level.
+    const tolerance = Math.min(1.0, gridStep / 3);
+    const fillSide: 'buy' | 'sell' = fill.is_buyer ? 'buy' : 'sell';
+
+    let match: any = null;
+    let bestDist = Infinity;
+    for (const level of gridLevels) {
+      if (level.is_filled) continue; // already flipped (gap) — nothing to do
+      if (level.side !== fillSide) continue;
+      const dist = Math.abs(level.price - fill.price);
+      if (dist < tolerance && dist < bestDist) {
+        match = level;
+        bestDist = dist;
+      }
+    }
+    if (!match) return false;
+
+    // Covered level = a live order rests there now. Either the fill was
+    // already handled (counter cycle re-placed it) or it belongs to an
+    // older grid generation. Touching it would duplicate orders.
+    if (liveOrderPrices.some((p) => Math.abs(p - match.price) < tolerance)) {
+      return false;
+    }
+
+    this.processedFills.add(fill.fill_id);
+    if (this.processedFills.size > 200) {
+      [...this.processedFills].slice(0, 100).forEach(e => this.processedFills.delete(e));
+    }
+
+    log.info(
+      `✅ Fill confirmed (backfill): ${match.side} @ $${match.price} (fill ${fill.fill_id}, size ${fill.size})`
+    );
+    await this.handleLevelFill(match, currentPrice, gridLevels);
+    return true;
   }
 
 

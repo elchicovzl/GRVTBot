@@ -218,6 +218,33 @@ export class WsDispatcher {
       );
     });
 
+    // Backfill reconciliation: the live GRVT position diverged from the
+    // grid-implied expectation beyond tolerance after a fill backfill.
+    // The engine deliberately does NOT auto-trade the residual away —
+    // this alert is the durable record the operator must act on.
+    this.engine.on('positionDrift', (payload: {
+      botId: number;
+      pair: string;
+      liveSize: number;
+      expectedSize: number;
+      drift: number;
+      tolerance: number;
+    }) => {
+      log.error({ ...payload }, 'position drift detected after backfill');
+      this.persistAlert(
+        payload.botId,
+        'position_drift',
+        'critical',
+        `Position drift on ${payload.pair}: live ${payload.liveSize} vs grid-implied ${payload.expectedSize.toFixed(6)} ` +
+        `(drift ${payload.drift.toFixed(6)} > tolerance ${payload.tolerance.toFixed(6)}). Not auto-corrected — review manually.`
+      );
+      wsBus.publishToMany(
+        [`bot:${payload.botId}`, 'bots', 'notifications'],
+        'positionDrift',
+        payload
+      );
+    });
+
     // H.2: auto-shift completed. Surfaces in the dashboard's notification
     // bell so the user knows the grid moved without having to diff the
     // chart manually.

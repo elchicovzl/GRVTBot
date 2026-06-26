@@ -1591,6 +1591,23 @@ export class GridBotDB {
   }
 
   /**
+   * Latest event_time stored for ONE bot, as a nanosecond string. Used
+   * by the engine's backfillFills() to know where the bot's fill record
+   * ends — everything newer than this on GRVT is a fill we never saw
+   * (downtime / WS gap). Returns null if the bot has no archived fills.
+   *
+   * MAX(event_time) on the TEXT column is safe because every stored
+   * value is a fixed-width 19-digit nanosecond timestamp (same
+   * convention as getLatestFillEventTime above).
+   */
+  async getLatestFillEventTimeForBot(botId: number): Promise<string | null> {
+    const row = await this.dbGet(`
+      SELECT MAX(event_time) AS et FROM fills_archive WHERE bot_id = ?
+    `, [botId]);
+    return (row?.et as string | undefined) ?? null;
+  }
+
+  /**
    * Aggregate fee summary for the rebates stat. Sum is the sum of raw
    * fee values (negative for maker rebates), so a NEGATIVE sum means
    * the user EARNED that much. count is included so the dashboard can
