@@ -415,6 +415,10 @@ const SIGNUP_LIMITER = makeAuthLimiter(3, 60 * 60 * 1000);
 // Password reset: 3 per hour. Stops email-bombing a known address. Stricter
 // than login because each call triggers an outbound email + DB write.
 const RESET_LIMITER = makeAuthLimiter(3, 60 * 60 * 1000);
+// #advisor: the config advisor runs MANY backtests per call (candidates ×
+// walk-forward windows), so cap it per IP — 10/min is plenty for interactive
+// use and stops a tab from hammering getKlines + the engine.
+const ADVISOR_LIMITER = makeAuthLimiter(10, 60 * 1000);
 
 // ─── The router ────────────────────────────────────────────────────────
 export function createV2Router(deps: V2RouterDeps): Router {
@@ -2924,6 +2928,75 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       res.json({ ...result, equityCurve: thinCurve });
     } catch (err) {
       res.status(500).json({ error: 'backtest_failed', message: (err as Error).message });
+    }
+    return;
+  }));
+
+  // ── POST /api/v2/bots/advisor ───────────────────────────────────────
+  // Config advisor: backtests candidate grid configs over walk-forward
+  // windows and returns ranked, regime-gated recommendations. Reuses the
+  // same server-side getKlines + runBacktest path as /backtest. Rate-limited
+  // (runs many backtests per call). See docs/design/config-advisor.md.
+  router.post('/bots/advisor', ADVISOR_LIMITER, asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as {
+      pair?: string;
+      direction?: 'long' | 'short';
+      investment_usdt?: number;
+      leverage?: number;
+      lower_price?: number;
+      upper_price?: number;
+      funding_rate_per_8h?: number;
+      interval?: string;
+      limit?: number;
+    };
+
+    const errors: string[] = [];
+    const pair = String(body.pair ?? '').trim();
+    const direction = body.direction === 'short' ? 'short' : 'long';
+    const investment = Number(body.investment_usdt);
+    const leverage = Number(body.leverage);
+    if (!pair) errors.push('pair is required');
+    if (!Number.isFinite(investment) || investment <= 0) errors.push('investment_usdt must be > 0');
+    if (!Number.isFinite(leverage) || leverage < 1 || leverage > 50) errors.push('leverage must be between 1 and 50');
+    // Range is optional; if either bound is given, both must be valid.
+    const hasLower = body.lower_price != null, hasUpper = body.upper_price != null;
+    if (hasLower !== hasUpper) errors.push('provide both lower_price and upper_price, or neither');
+    if (hasLower && hasUpper && !(Number(body.lower_price) < Number(body.upper_price))) {
+      errors.push('lower_price must be < upper_price');
+    }
+    if (body.funding_rate_per_8h != null && (!Number.isFinite(body.funding_rate_per_8h) || Math.abs(body.funding_rate_per_8h) > 0.01)) {
+      errors.push('funding_rate_per_8h in [-0.01, 0.01]');
+    }
+    if (errors.length) return res.status(400).json({ error: 'validation_failed', errors });
+
+    try {
+      // Default to 4h candles (~90 days) so walk-forward has multiple regimes.
+      const interval = body.interval ?? 'CI_4_H';
+      const limit = Math.min(Math.max(Number(body.limit) || 540, 90), 1000);
+      const klines = (await grvtClient.getKlines(pair, interval, limit)) as Array<{
+        openTime: number; open: number; high: number; low: number; close: number;
+      }>;
+      const candles = klines
+        .map((k) => ({ time: k.openTime / 1000, open: k.open, high: k.high, low: k.low, close: k.close }))
+        .reverse(); // oldest first
+
+      const { runAdvisor } = await import('../bot/advisor.js');
+      const result = runAdvisor(candles, {
+        pair,
+        direction,
+        investmentUSDT: investment,
+        leverage,
+        lowerPrice: hasLower ? Number(body.lower_price) : undefined,
+        upperPrice: hasUpper ? Number(body.upper_price) : undefined,
+        fundingRatePer8h: body.funding_rate_per_8h,
+      });
+
+      if (!result) {
+        return res.status(422).json({ error: 'insufficient_data', message: 'Not enough candle history to advise on this pair/interval.' });
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'advisor_failed', message: (err as Error).message });
     }
     return;
   }));

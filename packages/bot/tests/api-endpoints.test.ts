@@ -305,6 +305,56 @@ describe('POST /api/v2/bots/:id/range — F1.1 refusal propagation', () => {
   });
 });
 
+describe('POST /api/v2/bots/advisor — config advisor (V1b)', () => {
+  // Ranging market, newest-first (as GRVT returns), openTime in ms. The
+  // endpoint reverses to oldest-first before advising.
+  const advisorCandles = Array.from({ length: 120 }, (_, i) => {
+    const close = 100 + 5 * Math.sin(i / 3);
+    return { openTime: i * 14_400_000, open: close, high: close + 1, low: close - 1, close, volume: 1, trades: 1 };
+  }).reverse();
+
+  it('returns regime, verdict and ranked recommendations', async () => {
+    const { app, grvtClient } = createTestApp();
+    grvtClient.getKlines.mockResolvedValue(advisorCandles);
+
+    const res = await request(app)
+      .post('/api/v2/bots/advisor')
+      .set('X-Api-Key', API_KEY)
+      .send({ pair: 'ETH_USDT_Perp', direction: 'long', investment_usdt: 1000, leverage: 3 });
+
+    expect(res.status).toBe(200);
+    expect(['range', 'trend_up', 'trend_down']).toContain(res.body.regime.state);
+    expect(['recommend', 'caution', 'no_go']).toContain(res.body.verdict);
+    expect(Array.isArray(res.body.recommendations)).toBe(true);
+    expect(res.body.recommendations.length).toBeGreaterThan(0);
+    expect(res.body.recommendations[0].rank).toBe(1);
+    expect(res.body.recommendations[0].config.numGrids).toBeGreaterThanOrEqual(2);
+    expect(res.body.assumptions.candidatesEvaluated).toBeGreaterThan(0);
+    expect(res.body.assumptions.fundingModel).toMatch(/no historical funding/i);
+    expect(grvtClient.getKlines).toHaveBeenCalled();
+  });
+
+  it('400s on missing required fields', async () => {
+    const { app } = createTestApp();
+    const res = await request(app)
+      .post('/api/v2/bots/advisor')
+      .set('X-Api-Key', API_KEY)
+      .send({ direction: 'long', leverage: 3 }); // no pair, no investment
+    expect(res.status).toBe(400);
+    expect(res.body.errors.join(' ')).toMatch(/pair|investment/);
+  });
+
+  it('422s when there is not enough candle history to advise', async () => {
+    const { app, grvtClient } = createTestApp();
+    grvtClient.getKlines.mockResolvedValue(advisorCandles.slice(0, 10));
+    const res = await request(app)
+      .post('/api/v2/bots/advisor')
+      .set('X-Api-Key', API_KEY)
+      .send({ pair: 'ETH_USDT_Perp', direction: 'long', investment_usdt: 1000, leverage: 3 });
+    expect(res.status).toBe(422);
+  });
+});
+
 describe('POST /api/v2/bots/validate — #8 ATR spacing (opt-in)', () => {
   // 30 candles, each TR = 63 (3% of mid 2100) → ATR = 63 → atrPct = 3%.
   // k=0.6 → spacing 1.8% → spacingAbs 37.8 → numGrids round(600/37.8) = 16.
