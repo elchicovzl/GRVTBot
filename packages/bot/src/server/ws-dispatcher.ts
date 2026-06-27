@@ -229,7 +229,11 @@ export class WsDispatcher {
       // SAFEGUARD (liq proximity, SL/TP) and the MARGIN brake — derive
       // the alert type from the structured reason string.
       const reason = payload.reason ?? payload.error ?? '';
-      const type = reason.includes('MARGIN:') ? 'margin_pause' : 'safeguard';
+      const type = reason.includes('funding=')
+        ? 'funding_pause'
+        : reason.includes('MARGIN:')
+          ? 'margin_pause'
+          : 'safeguard';
       this.persistAlert(payload.botId, type, 'critical', reason || 'safeguard triggered');
       wsBus.publishToMany(
         [`bot:${payload.botId}`, 'bots', 'notifications'],
@@ -288,6 +292,35 @@ export class WsDispatcher {
       wsBus.publishToMany(
         [`bot:${payload.botId}`, 'bots', 'notifications'],
         'orphanedOrders',
+        payload
+      );
+    });
+
+    // #7 Funding safeguard (Nivel 1): predictive warning that the UPCOMING
+    // funding APR runs against the bot's inventory. Warning, not critical —
+    // it's a heads-up; the bot only PAUSES if hostile funding sustains, and
+    // that arrives via safeguardTriggered with a 'funding=' reason (persisted
+    // as a 'funding_pause' alert).
+    this.engine.on('fundingAlert', (payload: {
+      botId: number;
+      pair: string;
+      aprPct: number;
+      ratePct: number;
+      intervalHours: number;
+      nextFundingTime: number;
+    }) => {
+      log.warn({ ...payload }, 'hostile funding alert');
+      this.persistAlert(
+        payload.botId,
+        'funding_alert',
+        'warning',
+        `Hostile funding on ${payload.pair}: ${payload.aprPct.toFixed(0)}% APR ` +
+        `(${payload.ratePct.toFixed(4)}% / ${payload.intervalHours.toFixed(0)}h). ` +
+        `Monitoring — will pause if it sustains.`
+      );
+      wsBus.publishToMany(
+        [`bot:${payload.botId}`, 'bots', 'notifications'],
+        'fundingAlert',
         payload
       );
     });

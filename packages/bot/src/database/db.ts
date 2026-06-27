@@ -53,6 +53,10 @@ export interface GridBot {
   safeguard_enabled?: number;
   safeguard_threshold_pct?: number;
   safeguard_action?: 'pause' | 'pause_close';
+  // #7 funding safeguard (Nivel 1, APR). Opt-in per bot; 0 = no-op. The APR
+  // thresholds are env-tunable module constants (Moderado profile) in
+  // grid-engine.ts, not per-bot columns.
+  funding_safeguard_enabled?: number;
   // F.1: per-bot alert threshold overrides. When null, notifier uses
   // global defaults from env vars (NOTIFY_DRAWDOWN_PCT, etc.).
   alert_drawdown_pct?: number | null;
@@ -368,6 +372,13 @@ export class GridBotDB {
     try {
       await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN safeguard_action TEXT`);
       console.log('✅ Columna safeguard_action agregada a grid_bots');
+    } catch (e) { /* already exists */ }
+
+    // Migration: #7 funding safeguard (opt-in per bot). Legacy bots get 0 via
+    // the DEFAULT, so their behavior does not change after this migration.
+    try {
+      await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN funding_safeguard_enabled INTEGER DEFAULT 0`);
+      console.log('✅ Columna funding_safeguard_enabled agregada a grid_bots');
     } catch (e) { /* already exists */ }
 
     // F.1: per-bot alert threshold overrides. When null, the notifier

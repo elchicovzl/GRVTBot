@@ -2121,6 +2121,9 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       safeguard_enabled: boolean;
       safeguard_threshold_pct: number;
       safeguard_action: 'pause' | 'pause_close';
+      // #7 funding safeguard opt-in. Thresholds live as env-tunable module
+      // constants in grid-engine.ts (Moderado profile), so only the flag here.
+      funding_safeguard_enabled: boolean;
       // F2.3: opt-out de la escalación de cierres SL/TP a market order.
       // Default TRUE (columna DEFAULT 1); solo persistimos cuando el user
       // manda explícitamente false (cierres limit-only, control de slippage).
@@ -2179,6 +2182,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         safeguardAction = body.safeguard_action;
       }
     }
+
+    // #7: funding safeguard is a simple opt-in boolean — the APR thresholds
+    // are env-tunable constants in the engine, nothing to validate here.
+    const fundingSafeguardEnabled = body.funding_safeguard_enabled === true;
 
     if (errors.length > 0) {
       return res.status(400).json({ error: 'validation_failed', errors });
@@ -2291,6 +2298,12 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
           { botId, safeguardThresholdPct, safeguardAction },
           'safeguard configured at bot creation'
         );
+      }
+
+      // #7: persist funding safeguard opt-in (Nivel 1, APR-based).
+      if (fundingSafeguardEnabled) {
+        await dbRun(db, `UPDATE grid_bots SET funding_safeguard_enabled = 1 WHERE id = ?`, [botId]);
+        log.info({ botId }, 'funding safeguard enabled at bot creation');
       }
 
       // H.3: stop-loss / take-profit (optional per-bot)

@@ -126,9 +126,18 @@ class FakeGrvtClient {
     return 'fake-sub-account';
   }
 
+  /** #7 funding safeguard: per-interval funding rate (decimal) + next funding
+   *  boundary (ms). Tests mutate these between monitor ticks to drive rollovers. */
+  fundingRate = 0;
+  nextFundingTime = 0;
+
   async getTicker(_pair: string) {
     this.calls.getTicker++;
-    return { last_price: String(this.price) };
+    return {
+      last_price: String(this.price),
+      funding_rate: String(this.fundingRate),
+      next_funding_time: this.nextFundingTime,
+    };
   }
 
   async getOpenOrders(_pair?: string) {
@@ -986,6 +995,139 @@ describe('monitor(): insufficient-margin rejection during re-placement', () => {
 });
 
 // ── 6. Error isolation in monitorAllBots ─────────────────────────────
+
+// ── 5b. #7 Funding safeguard (Nivel 1, APR) ──────────────────────────
+//
+// assertFundingHeadroom() reuses the ticker monitor() already fetched. It
+// NEVER thresholds the raw per-interval rate — GRVT's funding interval is
+// per-market and switches 1h/4h/8h — it infers the interval from consecutive
+// next_funding_time values and ANNUALIZES (APR). Two reactions: a predictive
+// ALERT (>= alert APR, surfaced via fundingAlertPending → 'fundingAlert'
+// event, no pause) and a PAUSE when the applied APR stays hostile for >= 2
+// consecutive intervals (throws SAFEGUARD:pause). Side-aware + opt-in.
+
+describe('monitor(): #7 funding safeguard (APR-based)', () => {
+  const HOUR = 3_600_000;
+  const T0 = 1_700_000_000_000; // fixed ms epoch — deterministic, no Date.now
+
+  // Seed a fully-covered long grid that already holds inventory, with the
+  // funding safeguard opted in. monitor() is quiet except for the funding check.
+  function fundingWorld(rate: number, overrides: Record<string, any> = {}) {
+    const { db, client } = setupWorld();
+    const bot = makeBot({ funding_safeguard_enabled: 1, avg_entry_price: 2000, position_size: 0.25, ...overrides });
+    db.addBot(bot);
+    seedGrid(db, bot, 2008);
+    client.price = 2008;
+    coverGrid(client, db, bot.id);
+    client.positions = [{ instrument: PAIR, size: '0.25', unrealized_pnl: '0', entry_price: '2000' }];
+    client.fundingRate = rate;
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const alerts: any[] = [];
+    const safeguards: any[] = [];
+    engine.on('fundingAlert', (e) => alerts.push(e));
+    engine.on('safeguardTriggered', (e) => safeguards.push(e));
+    // tick(n): set next_funding_time to T0 + n*intervalH hours, then run one sweep.
+    const tickAt = async (nft: number) => { client.nextFundingTime = nft; await (engine as any).monitorAllBots(); };
+    return { db, client, engine, instance, alerts, safeguards, tickAt };
+  }
+
+  it('pauses after the applied funding APR stays hostile for >= 2 intervals (8h)', async () => {
+    // 0.0021/8h ≈ 230% APR (> 220% pause threshold). Long pays when rate > 0.
+    const { db, client, alerts, safeguards, tickAt } = fundingWorld(0.0021);
+
+    await tickAt(T0 + 8 * HOUR);   // first observation: seed, no interval yet
+    await tickAt(T0 + 16 * HOUR);  // rollover #1: interval learned (8h), streak=1, alert fires
+    expect(alerts).toHaveLength(1);
+    expect(db.bots.get(1).status).toBe('running'); // not yet — needs 2 intervals
+    await tickAt(T0 + 24 * HOUR);  // rollover #2: streak=2 → SAFEGUARD:pause
+
+    expect(db.bots.get(1).status).toBe('paused');
+    expect(client.calls.cancelAllOrders).toBe(1);
+    expect((/* engine */ safeguards)).toHaveLength(1);
+    expect(safeguards[0].action).toBe('pause');
+    expect(safeguards[0].reason).toContain('SAFEGUARD:pause');
+    expect(safeguards[0].reason).toContain('funding=');
+  });
+
+  it('alerts but does NOT pause when hostile funding stays between the alert and pause bands', async () => {
+    // 0.0014/8h ≈ 153% APR: >= 110% (alert) but < 220% (pause). Hysteresis
+    // holds the streak at 0, so it never escalates no matter how long it lasts.
+    const { db, alerts, safeguards, tickAt } = fundingWorld(0.0014);
+
+    await tickAt(T0 + 8 * HOUR);
+    await tickAt(T0 + 16 * HOUR);
+    await tickAt(T0 + 24 * HOUR);
+    await tickAt(T0 + 32 * HOUR);
+
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    expect(safeguards).toHaveLength(0);
+    expect(db.bots.get(1).status).toBe('running');
+  });
+
+  it('normalizes by interval: the SAME rate is safe at 8h but pauses at 1h', async () => {
+    // 0.0003 per interval → ~33% APR at 8h (safe) but ~263% APR at 1h (pause).
+    // This is the whole point of annualizing instead of thresholding raw rate.
+
+    // 8h: no alert, no pause across several intervals.
+    {
+      const { db, alerts, safeguards, tickAt } = fundingWorld(0.0003);
+      await tickAt(T0 + 8 * HOUR);
+      await tickAt(T0 + 16 * HOUR);
+      await tickAt(T0 + 24 * HOUR);
+      expect(alerts).toHaveLength(0);
+      expect(safeguards).toHaveLength(0);
+      expect(db.bots.get(1).status).toBe('running');
+    }
+
+    // 1h: same rate, interval inferred as 1h → pauses after 2 rollovers.
+    {
+      const { db, safeguards, tickAt } = fundingWorld(0.0003);
+      await tickAt(T0 + 1 * HOUR);
+      await tickAt(T0 + 2 * HOUR);
+      await tickAt(T0 + 3 * HOUR);
+      expect(db.bots.get(1).status).toBe('paused');
+      expect(safeguards[0].reason).toContain('funding=');
+    }
+  });
+
+  it('is side-aware: does NOT fire when funding favors the bot (long earns on negative rate)', async () => {
+    // Large magnitude but NEGATIVE: a long EARNS funding here → not hostile.
+    const { db, alerts, safeguards, tickAt } = fundingWorld(-0.0021);
+    await tickAt(T0 + 8 * HOUR);
+    await tickAt(T0 + 16 * HOUR);
+    await tickAt(T0 + 24 * HOUR);
+    expect(alerts).toHaveLength(0);
+    expect(safeguards).toHaveLength(0);
+    expect(db.bots.get(1).status).toBe('running');
+  });
+
+  it('does nothing without a position, or when the safeguard is opted out', async () => {
+    // No position (avg_entry_price = 0 AND no live position): no funding
+    // exposure. Clear the live position too, else updatePnL() re-derives
+    // avg_entry_price from it mid-tick and the check would arm.
+    {
+      const { db, client, alerts, safeguards, tickAt } = fundingWorld(0.0021, { avg_entry_price: 0, position_size: 0 });
+      client.positions = [];
+      await tickAt(T0 + 8 * HOUR);
+      await tickAt(T0 + 16 * HOUR);
+      await tickAt(T0 + 24 * HOUR);
+      expect(alerts).toHaveLength(0);
+      expect(safeguards).toHaveLength(0);
+      expect(db.bots.get(1).status).toBe('running');
+    }
+    // Opted out (funding_safeguard_enabled = 0): the check never runs.
+    {
+      const { db, alerts, safeguards, tickAt } = fundingWorld(0.0021, { funding_safeguard_enabled: 0 });
+      await tickAt(T0 + 8 * HOUR);
+      await tickAt(T0 + 16 * HOUR);
+      await tickAt(T0 + 24 * HOUR);
+      expect(alerts).toHaveLength(0);
+      expect(safeguards).toHaveLength(0);
+      expect(db.bots.get(1).status).toBe('running');
+    }
+  });
+});
 
 describe('monitorAllBots(): error isolation', () => {
   it('one bot throwing a non-SAFEGUARD error does not prevent other bots from being monitored', async () => {
