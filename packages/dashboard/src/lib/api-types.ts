@@ -288,6 +288,68 @@ export interface BacktestResult {
   candlesProcessed: number;
 }
 
+// Config advisor: POST /api/v2/bots/advisor. Backtests candidate grid configs
+// over walk-forward windows and returns regime-gated, robustness-ranked
+// recommendations. No orders placed.
+export interface AdvisorInput {
+  pair: string;
+  direction: 'long' | 'short';
+  investment_usdt: number;
+  leverage: number;
+  /** Optional user range; when omitted the advisor proposes one from recent high/low. */
+  lower_price?: number;
+  upper_price?: number;
+  funding_rate_per_8h?: number;
+  interval?: CandleInterval;
+  limit?: number;
+}
+
+export interface AdvisorRobustness {
+  meanRetPct: number;
+  medianRetPct: number;
+  worstRetPct: number;
+  bestRetPct: number;
+  winRatePct: number;
+  worstMaxDrawdownPct: number;
+  windows: number;
+}
+
+export interface AdvisorRecommendation {
+  rank: number;
+  config: {
+    lowerPrice: number;
+    upperPrice: number;
+    numGrids: number;
+    spacingPct: number;
+    direction: 'long' | 'short';
+    rangeSource: 'user' | 'recent';
+    k: number;
+  };
+  robustness: AdvisorRobustness;
+  perWindow: Array<{ retPct: number; maxDDPct: number }>;
+  reasonCodes: string[];
+  confidence: 'high' | 'med' | 'low';
+  equityCurve?: Array<{ time: number; equity: number }>;
+}
+
+export interface AdvisorResult {
+  regime: {
+    state: 'range' | 'trend_up' | 'trend_down';
+    efficiencyRatio: number;
+    trendPct: number;
+    window: number;
+  };
+  verdict: 'recommend' | 'caution' | 'no_go';
+  recommendations: AdvisorRecommendation[];
+  assumptions: {
+    lookbackCandles: number;
+    windows: number;
+    fundingRatePer8h: number;
+    fundingModel: string;
+    candidatesEvaluated: number;
+  };
+}
+
 export interface OrderRow {
   id: number;
   order_id: string;
