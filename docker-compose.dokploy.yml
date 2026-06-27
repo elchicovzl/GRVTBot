@@ -1,0 +1,98 @@
+# GRVT Grid — Dokploy / managed-PaaS stack.
+#
+# Same images as docker-compose.yml, but tailored for a managed Docker host
+# (Dokploy, Coolify, Railway-on-compose, etc.) where:
+#   - bind-mounting a host file for the AES master key is awkward, so the key
+#     lives on a dedicated NAMED VOLUME (`bot-secrets`) instead, addressed via
+#     MASTER_KEY_PATH. The volume persists across redeploys.
+#   - TLS + routing are handled by the platform's reverse proxy (Traefik on
+#     Dokploy), so there is no caddy service — just map a domain to the `bot`
+#     service on port 3848 in the Dokploy UI.
+#
+# Why a separate file (not a change to docker-compose.yml): the canonical
+# compose keeps the master key as a host file at /etc/grvt-grid/master.key.
+# Changing that default would break existing self-hosters on redeploy (their
+# key is on the host, not in a volume — the bot would find an empty volume and
+# fail to decrypt stored credentials). This file is opt-in.
+#
+# FIRST-RUN — generate the master key once into the volume (the bot boots fine
+# without it; the key is only read lazily when you save GRVT credentials):
+#   1. Deploy this stack.
+#   2. Open the `bot` container's terminal (Dokploy → app → Terminal) and run:
+#        head -c 32 /dev/urandom > /app/secrets/master.key && chmod 600 /app/secrets/master.key
+#   3. Back the key up OFF-HOST (encrypted USB / password manager). Losing it
+#      makes every stored GRVT credential unrecoverable. Then add your GRVT
+#      credentials in the dashboard.
+#
+# Env: set GRVT_API_KEY, GRVT_API_SECRET, GRVT_TRADING_ACCOUNT_ID,
+# GRVT_TRADING_ADDRESS, JWT_SECRET (32+ chars), DASHBOARD_API_KEY (64 chars),
+# and optionally TELEGRAM_* in the Dokploy Environment for this app.
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: packages/bot/Dockerfile
+    image: grvt-grid/bot:latest
+    container_name: grvt-grid-bot
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DASHBOARD_PORT: "3848"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Master key on the persistent named volume instead of a host bind.
+      MASTER_KEY_PATH: /app/secrets/master.key
+    volumes:
+      - bot-data:/app/data
+      - bot-logs:/app/logs
+      - bot-secrets:/app/secrets
+    expose:
+      - "3848"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:3848/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Optional Telegram alerts. Enable with the `with-notifier` profile.
+  notifier:
+    build:
+      context: .
+      dockerfile: packages/notifier/Dockerfile
+    image: grvt-grid/notifier:latest
+    container_name: grvt-grid-notifier
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      GRID_BOT_DB: /shared-data/grid_bot.db
+      NOTIFIER_STATE_DIR: /var/lib/grvt-grid-notifier
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      NOTIFIER_HEALTH_PORT: "3849"
+    volumes:
+      - bot-data:/shared-data:ro
+      - notifier-state:/var/lib/grvt-grid-notifier
+      - notifier-logs:/app/logs
+    depends_on:
+      bot:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:3849/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    profiles: ["with-notifier"]
+
+volumes:
+  bot-data:
+  bot-logs:
+  bot-secrets:
+  notifier-state:
+  notifier-logs:

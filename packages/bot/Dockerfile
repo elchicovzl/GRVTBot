@@ -87,6 +87,14 @@ COPY --from=dashboard-builder --chown=grvtbot:grvtbot /build/packages/dashboard/
 RUN mkdir -p /app/data && chown grvtbot:grvtbot /app/data
 VOLUME /app/data
 
+# Secrets dir: optional mount point for the AES master key when running on a
+# managed PaaS (e.g. Dokploy) where bind-mounting a host file is awkward — see
+# docker-compose.dokploy.yml. Created + chowned so a named volume mounted here
+# inherits grvtbot ownership and uid 10000 can write the key. No VOLUME
+# instruction on purpose: the canonical docker-compose.yml does NOT mount this,
+# and we don't want a dangling anonymous volume on those deployments.
+RUN mkdir -p /app/secrets && chown grvtbot:grvtbot /app/secrets
+
 USER grvtbot
 EXPOSE 3848
 
