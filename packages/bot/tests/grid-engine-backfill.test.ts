@@ -555,6 +555,113 @@ describe('resume (loadActiveBots): backfill restores grid coherence after downti
   });
 });
 
+// ── 2b. Resume: orphaned-order reconciliation (#6) ───────────────────
+
+describe('resume (loadActiveBots): orphaned-order reconciliation (#6)', () => {
+  it('cancels open orders matching no grid level and emits an orphanedOrders alert, leaving grid orders intact', async () => {
+    const { db, client } = setupWorld();
+    const bot = makeBot();
+    db.addBot(bot);
+    seedGrid(db, bot, 2008);
+    client.price = 2008;
+    coverGrid(client, db, bot.id); // every grid level has a resting order
+    // Grid-implied long = 5 sells (idx 6-10) × 0.05 = 0.25 → set live position
+    // to match so the #4 drift check stays quiet and we isolate #6.
+    client.positions = [{ instrument: PAIR, size: '0.25', unrealized_pnl: '0', entry_price: '1990' }];
+
+    // Two orphans on the book at prices that match NO grid level (grid is
+    // every $20): a buy at $1955 and a sell at $2075 — crash leftovers.
+    const orphanBuy = client.coverLevel({ price: 1955, side: 'buy' });
+    const orphanSell = client.coverLevel({ price: 2075, side: 'sell' });
+
+    const engine = new GridEngine();
+    const orphanEvents: any[] = [];
+    const driftEvents: any[] = [];
+    engine.on('orphanedOrders', (e) => orphanEvents.push(e));
+    engine.on('positionDrift', (e) => driftEvents.push(e));
+
+    // Engine restart path: loadActiveBots → resumeBotInstance.
+    await (engine as any).loadActiveBots();
+
+    // Bot resumed and registered.
+    expect((engine as any).bots.size).toBe(1);
+    expect(db.bots.get(1).status).toBe('running');
+
+    // Both orphans cancelled on GRVT and removed from the book.
+    expect(client.calls.cancelOrder).toContain(orphanBuy);
+    expect(client.calls.cancelOrder).toContain(orphanSell);
+    expect(client.ordersAtPrice(1955)).toHaveLength(0);
+    expect(client.ordersAtPrice(2075)).toHaveLength(0);
+
+    // Legit grid orders left intact: every grid price still has its order.
+    for (const lvl of db.levels.filter((l) => l.bot_id === 1)) {
+      expect(client.ordersAtPrice(lvl.price)).toHaveLength(1);
+    }
+
+    // Single alert with full context (ws-dispatcher persists it as an
+    // 'orphaned_orders' row in the alerts table).
+    expect(orphanEvents).toHaveLength(1);
+    expect(orphanEvents[0]).toMatchObject({ botId: 1, pair: PAIR, count: 2 });
+    expect(orphanEvents[0].orders).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ price: 1955, side: 'buy', orderId: orphanBuy }),
+        expect.objectContaining({ price: 2075, side: 'sell', orderId: orphanSell }),
+      ])
+    );
+
+    // #6 touches ORDERS only: no position drift, no corrective trades.
+    expect(driftEvents).toHaveLength(0);
+    expect(client.calls.createOrder).toHaveLength(0);
+  });
+
+  it('a clean resume with no orphans emits nothing and cancels nothing', async () => {
+    const { db, client } = setupWorld();
+    const bot = makeBot();
+    db.addBot(bot);
+    seedGrid(db, bot, 2008);
+    client.price = 2008;
+    coverGrid(client, db, bot.id); // book == grid exactly, no orphans
+    client.positions = [{ instrument: PAIR, size: '0.25', unrealized_pnl: '0', entry_price: '1990' }];
+
+    const engine = new GridEngine();
+    const orphanEvents: any[] = [];
+    engine.on('orphanedOrders', (e) => orphanEvents.push(e));
+
+    await (engine as any).loadActiveBots();
+
+    expect(orphanEvents).toHaveLength(0);
+    expect(client.calls.cancelOrder).toHaveLength(0);
+  });
+
+  it('a failed orphan cancel is non-fatal: resume completes and no alert fires for the un-cancelled orphan', async () => {
+    const { db, client } = setupWorld();
+    const bot = makeBot();
+    db.addBot(bot);
+    seedGrid(db, bot, 2008);
+    client.price = 2008;
+    coverGrid(client, db, bot.id);
+    client.positions = [{ instrument: PAIR, size: '0.25', unrealized_pnl: '0', entry_price: '1990' }];
+    client.coverLevel({ price: 1955, side: 'buy' }); // single orphan
+
+    // GRVT rejects the orphan cancel (already gone / transient error). Only
+    // orphan cancels run at resume, so this single rejection hits the orphan.
+    vi.spyOn(client, 'cancelOrder').mockRejectedValueOnce(new Error('GRVT 500: cancel failed'));
+
+    const engine = new GridEngine();
+    const orphanEvents: any[] = [];
+    engine.on('orphanedOrders', (e) => orphanEvents.push(e));
+
+    // Resume must NOT throw despite the failed cancel.
+    await (engine as any).loadActiveBots();
+    expect((engine as any).bots.size).toBe(1);
+    expect(db.bots.get(1).status).toBe('running');
+
+    // Nothing was actually cancelled → no alert (orphan left for the
+    // monitor's duplicate killer on the first tick).
+    expect(orphanEvents).toHaveLength(0);
+  });
+});
+
 // ── 3. Idempotency ───────────────────────────────────────────────────
 
 describe('backfillFills(): idempotency', () => {
