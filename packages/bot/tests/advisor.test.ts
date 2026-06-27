@@ -76,6 +76,19 @@ describe('runAdvisor', () => {
     expect(sources).toContain('user');
   });
 
+  it('caps num_grids to what the investment can create (min notional per grid)', () => {
+    // $50 × 3x = $150 effective / $20 min notional = 7 grids max. The advisor
+    // must never recommend more — bot creation would reject it.
+    const r = runAdvisor(rangingCandles(), {
+      pair: 'X', direction: 'long', investmentUSDT: 50, leverage: 3, minNotionalPerGrid: 20,
+    })!;
+    expect(r.recommendations.length).toBeGreaterThan(0);
+    for (const rec of r.recommendations) {
+      expect(rec.config.numGrids).toBeLessThanOrEqual(7);
+      expect(rec.config.numGrids).toBeGreaterThanOrEqual(2);
+    }
+  });
+
   it('returns null with insufficient candle history', () => {
     expect(runAdvisor(rangingCandles(10), { pair: 'X', direction: 'long', investmentUSDT: 1000, leverage: 3 })).toBeNull();
   });
