@@ -908,15 +908,13 @@ describe('monitor(): insufficient-margin rejection during re-placement', () => {
     expect(events).toHaveLength(1);
   });
 
-  // GAP (feeds F2.1): INSUFFICIENT_MARGIN_RE is flagged in the source as
-  // UNCONFIRMED against a real GRVT rejection. If GRVT's actual error body
-  // never says "margin"/"insufficient margin" (e.g. a bare numeric code or
-  // "BALANCE_TOO_LOW"), the brake does NOT fire and the pre-P0 behavior
-  // remains: the re-place loop contains the failure, the bot keeps running,
-  // and the level is retried on later ticks. This test documents that gap
-  // so F2.1 (confirm the real signature + fallback) must consciously
-  // change it.
-  it('does NOT trigger the brake for a rejection that misses INSUFFICIENT_MARGIN_RE (unconfirmed-signature gap, F2.1)', async () => {
+  // F2.1 CLOSED: isInsufficientMarginError() now also matches the GRVT error
+  // CODE 3022, even when the message carries no "margin" wording (e.g.
+  // `{"code":3022,"message":"BALANCE_TOO_LOW"}`). Same code, same underlying
+  // condition (can't place the order safely), same conservative consequence:
+  // pause. This FLIPS the pre-F2.1 gap where such a rejection was silently
+  // contained and the bot kept placing orders against an exhausted account.
+  it('routes a code-3022 rejection with no "margin" wording to the margin pause path (F2.1 fallback by code)', async () => {
     const { db, client } = setupWorld();
     const bot = makeBot();
     db.addBot(bot);
@@ -924,8 +922,8 @@ describe('monitor(): insufficient-margin rejection during re-placement', () => {
     client.price = 2008;
     coverGrid(client, db, bot.id, [5, 2]); // idx 2 will be re-placed
 
-    // Plausible GRVT rejection for the same underlying condition that does
-    // NOT match the regex (no "margin" wording at all).
+    // GRVT rejection for the same underlying condition that the WORDING regex
+    // misses (no "margin" anywhere) but the CODE regex catches via "code":3022.
     client.createOrderErrors = [new Error('HTTP 400: {"code":3022,"message":"BALANCE_TOO_LOW"}')];
 
     const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
@@ -935,17 +933,55 @@ describe('monitor(): insufficient-margin rejection during re-placement', () => {
 
     await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
 
-    // The placement was attempted and rejected...
+    // The placement was attempted once and rejected — no retry storm.
     expect(client.calls.createOrder).toHaveLength(1);
     expect(client.ordersAtPrice(1940)).toHaveLength(0);
-    // ...but the brake did NOT fire: contained by the re-place loop, no
-    // pause, no event, bot still monitored next tick.
+
+    // Brake fired BY CODE despite no "margin" wording: bot paused (NOT
+    // auto-closed), resting orders cancelled, removed from the loop.
+    expect(db.bots.get(1).status).toBe('paused');
+    expect(client.calls.cancelAllOrders).toBe(1);
+    expect(client.openOrders).toHaveLength(0);
+    expect((engine as any).bots.size).toBe(0);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].botId).toBe(1);
+    expect(events[0].action).toBe('pause');
+    expect(events[0].reason).toContain('MARGIN:pause');
+    expect(events[0].reason).toContain('grvt_reject');
+  });
+
+  // PRECISION GUARD: the code fallback must match 3022 only as an error CODE
+  // (`"code":3022` / `code 3022`), never as a bare number embedded in a price,
+  // quantity or id. A rejection that merely happens to contain "3022" elsewhere
+  // and carries no margin wording must NOT trip the brake — otherwise the bot
+  // would pause on unrelated failures.
+  it('does NOT trigger the brake when 3022 appears as a price, not an error code', async () => {
+    const { db, client } = setupWorld();
+    const bot = makeBot();
+    db.addBot(bot);
+    seedGrid(db, bot, 2008);
+    client.price = 2008;
+    coverGrid(client, db, bot.id, [5, 2]); // idx 2 will be re-placed
+
+    // Unrelated rejection: 3022 is part of a price, not a code field, and there
+    // is no "margin" wording.
+    client.createOrderErrors = [new Error('HTTP 400: {"code":9999,"message":"price 3022.5 out of band"}')];
+
+    const instance = new GridBotInstance(db.bots.get(1) as any, client as any);
+    const engine = makeEngine([[1, instance]]);
+    const events: any[] = [];
+    engine.on('safeguardTriggered', (e) => events.push(e));
+
+    await expect((engine as any).monitorAllBots()).resolves.toBeUndefined();
+
+    // Attempted and rejected, but the brake did NOT fire: no pause, no event,
+    // bot still monitored next tick.
+    expect(client.calls.createOrder).toHaveLength(1);
     expect(db.bots.get(1).status).toBe('running');
     expect(client.calls.cancelAllOrders).toBe(0);
     expect(events).toHaveLength(0);
     expect((engine as any).bots.size).toBe(1);
-    // Not routed to the 7201 pending_replace path either (different error).
-    expect(db.levelAt(1, 2).pending_replace).toBeFalsy();
   });
 });
 

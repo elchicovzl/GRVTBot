@@ -509,12 +509,28 @@ const MAX_NOTIONAL_CAP_ENABLED = true;
 // el rebalanceo normal del grid + algo de compound sin permitir que el notional
 // se duplique respecto al capital original.
 const MAX_NOTIONAL_SAFETY_FACTOR = 1.5;
-// ⚠️ SIGNATURE NO CONFIRMADA contra un rechazo REAL de GRVT. El cliente lanza
-// `HTTP <status>: <errorText>` con el body crudo de GRVT, así que matcheamos el
-// texto del rechazo. No conocemos el string/código exacto de "margen
-// insuficiente" de GRVT, así que matcheamos amplio y case-insensitive. DEBE
-// confirmarse contra un rechazo real (ver flagged en el resumen).
+// El cliente lanza `HTTP <status>: <errorText>` con el body crudo de GRVT, así
+// que matcheamos el texto del rechazo. Detectamos por DOS vías complementarias:
+//   1. WORDING — el mensaje contiene "insufficient margin" / variantes.
+//   2. CÓDIGO  — GRVT devuelve el código 3022 para margen insuficiente. El mismo
+//      código aparece con mensajes que NO contienen la palabra "margin"
+//      (p. ej. `{"code":3022,"message":"BALANCE_TOO_LOW"}`): distinto root
+//      (balance bajo vs margen), mismo código, misma consecuencia — NO podemos
+//      colocar la orden de forma segura. En ambos casos pausamos (conservador
+//      con DINERO REAL): seguir colocando sobre una cuenta exhausta arma medio
+//      grid y arriesga liquidación.
+// El fallback por código cierra el hueco F2.1: antes, un rechazo 3022 sin la
+// palabra "margin" escapaba el regex y el bot seguía colocando órdenes.
 const INSUFFICIENT_MARGIN_RE = /insufficient.*margin|margin.*insufficient|cross.?margin.*(insufficient|balance)/i;
+// Matcheamos 3022 SÓLO cuando aparece como CÓDIGO (campo `"code":3022` en JSON o
+// `code 3022` en texto), nunca como número suelto, para no frenar por un 3022
+// que sea parte de un precio/cantidad en el mensaje.
+const INSUFFICIENT_MARGIN_CODE_RE = /(?:"code"\s*:\s*|\bcode[\s=:]+)3022\b/i;
+// Un rechazo de GRVT es "margen insuficiente" si matchea por WORDING o por
+// CÓDIGO. Fuente única de verdad: usada por todos los catch de colocación.
+function isInsufficientMarginError(msg: string): boolean {
+  return INSUFFICIENT_MARGIN_RE.test(msg) || INSUFFICIENT_MARGIN_CODE_RE.test(msg);
+}
 
 // ── FILL BACKFILL / POSITION RECONCILIATION (DINERO REAL) ───────────────────
 // La detección de fills en vivo depende de (a) getFillHistory REST con una
@@ -4071,12 +4087,12 @@ export class GridBotInstance {
       // reintentar — seguir colocando sobre una cuenta exhausta arma medio grid
       // y arriesga liquidación. Convertimos el rechazo en un 'MARGIN:pause'
       // estructurado que monitorAllBots rutea al pause path (igual patrón que
-      // 'SAFEGUARD:pause_close'). ⚠️ La signature NO está confirmada contra un
-      // rechazo real de GRVT (ver INSUFFICIENT_MARGIN_RE).
+      // 'SAFEGUARD:pause_close'). Detecta por wording O por código 3022
+      // (ver isInsufficientMarginError / hueco F2.1).
       if (
         MARGIN_BRAKE_ENABLED &&
         error instanceof Error &&
-        INSUFFICIENT_MARGIN_RE.test(error.message)
+        isInsufficientMarginError(error.message)
       ) {
         log.error(`🚨 Bot ${this.bot.id}: GRVT rechazó por MARGEN INSUFICIENTE en nivel ${level.level_index} — pausando bot (no reintentar). Rechazo: ${error.message}`);
         throw new Error(
@@ -4668,12 +4684,12 @@ export class GridBotInstance {
         // insuficiente. placeGridOrder ya convierte el rechazo de GRVT en un
         // 'MARGIN:pause' estructurado; re-lanzamos para que monitorAllBots
         // pause el bot (igual ruteo que 'SAFEGUARD:pause_close'). Matcheamos
-        // también la signature cruda por si el rechazo escapa por otro camino.
-        // ⚠️ Signature de GRVT NO confirmada (ver INSUFFICIENT_MARGIN_RE).
+        // también la signature cruda por si el rechazo escapa por otro camino
+        // (wording o código 3022, ver isInsufficientMarginError).
         if (msg.includes('MARGIN:')) {
           throw error;
         }
-        if (MARGIN_BRAKE_ENABLED && INSUFFICIENT_MARGIN_RE.test(msg)) {
+        if (MARGIN_BRAKE_ENABLED && isInsufficientMarginError(msg)) {
           log.error(`🚨 Bot ${this.bot.id}: GRVT rechazó counter-order por MARGEN INSUFICIENTE — pausando bot (no reintentar). Rechazo: ${msg}`);
           throw new Error(
             `MARGIN:pause:bot=${this.bot.id}:grvt_reject — GRVT rechazó counter-order por margen insuficiente: ${msg}`
