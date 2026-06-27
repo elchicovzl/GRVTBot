@@ -2121,6 +2121,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       safeguard_enabled: boolean;
       safeguard_threshold_pct: number;
       safeguard_action: 'pause' | 'pause_close';
+      // F2.3: opt-out de la escalación de cierres SL/TP a market order.
+      // Default TRUE (columna DEFAULT 1); solo persistimos cuando el user
+      // manda explícitamente false (cierres limit-only, control de slippage).
+      close_escalation: boolean;
       virtual_enabled: boolean;
       active_window_size: number;
       // H.5: optional sub-account routing. Null/missing = default creds.
@@ -2312,6 +2316,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       if (slTpUpdates.length > 0) {
         slTpParams.push(botId);
         await dbRun(db, `UPDATE grid_bots SET ${slTpUpdates.join(', ')} WHERE id = ?`, slTpParams);
+      }
+
+      // F2.3: per-bot opt-out de la escalación de cierres a market. La
+      // columna tiene DEFAULT 1 (ON), así que solo escribimos el opt-out
+      // explícito. Cualquier otro valor (true/undefined/basura) → default.
+      if (body.close_escalation === false) {
+        await dbRun(db, `UPDATE grid_bots SET close_escalation = 0 WHERE id = ?`, [botId]);
+        log.info({ botId }, 'close escalation disabled at bot creation (limit-only closes)');
       }
 
       cache.invalidatePrefix('bots');
