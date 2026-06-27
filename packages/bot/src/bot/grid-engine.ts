@@ -570,6 +570,25 @@ const POSITION_DRIFT_TOLERANCE_FACTOR = envTunable(
   0.5
 );
 
+// ── FUNDING SAFEGUARD (#7, DINERO REAL) ──────────────────────────────
+// Perfil "Moderado" (ver research). Los thresholds van sobre el APR
+// ANUALIZADO, NO sobre el rate por intervalo: GRVT configura el intervalo de
+// funding por mercado (1h/4h/8h) y SALTA a 1h justo cuando el funding se pone
+// hostil, así que el rate crudo no es comparable entre mercados ni en el
+// tiempo. Lo anualizamos con el intervalo INFERIDO de next_funding_time
+// consecutivos (aprende solo si GRVT switchea). Opt-in por bot
+// (funding_safeguard_enabled). SIEMPRE pausa, nunca cierra (cerrar ante
+// funding hostil cerca de una posible liq es el peor momento — misma filosofía
+// que el freno de margen). Env-overridable.
+const FUNDING_ALERT_APR_PCT = envTunable('GRVT_FUNDING_ALERT_APR_PCT', 110);    // ~0.10%/8h-equiv
+const FUNDING_PAUSE_APR_PCT = envTunable('GRVT_FUNDING_PAUSE_APR_PCT', 220);    // ~0.20%/8h-equiv
+const FUNDING_PAUSE_INTERVALS = envTunable('GRVT_FUNDING_PAUSE_INTERVALS', 2);  // sostenido >= 2 intervalos
+const MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000;
+// Cotas de cordura para el intervalo inferido: descartan un delta bogus de
+// next_funding_time (clock skew, o un tick que abarcó días tras un downtime).
+const FUNDING_INTERVAL_MIN_MS = 30 * 60 * 1000;        // 30m
+const FUNDING_INTERVAL_MAX_MS = 24 * 60 * 60 * 1000;   // 24h
+
 /**
  * Local estimate of liquidation price for the safeguard check. Uses the
  * bot's current avg_entry_price (updated on every fill) and leverage,
@@ -1908,6 +1927,14 @@ export class GridEngine extends EventEmitter {
       try {
         await instance.monitor();
         this.lastMonitorSuccess.set(botId, Date.now());
+        // #7 funding safeguard: surface a predictive funding alert. The
+        // instance can't emit directly, so it parks it on a field (same
+        // pattern as autoShiftRequested) and we emit it here.
+        const fundingAlert = instance.fundingAlertPending;
+        if (fundingAlert) {
+          instance.fundingAlertPending = null;
+          this.emit('fundingAlert', { botId, pair: instance.getBot().pair, ...fundingAlert });
+        }
       } catch (error) {
         // G.5: classified error counter (safeguard/margin/api_timeout/…)
         botMetrics.recordError(botId, classifyMonitorError(error));
@@ -3157,6 +3184,16 @@ export class GridBotInstance {
   private processedFills = new Set<string>(); // ⚠️ NUEVO: Deduplicación de fills
   // H.2: set by monitor() when price exits range; consumed by engine's auto-shift check
   autoShiftRequested: { currentPrice: number; exitDist: number } | null = null;
+
+  // #7 funding safeguard (Nivel 1, APR) — per-bot rolling state.
+  private fundingPrevNextTime: number | null = null;  // last seen next_funding_time
+  private fundingPrevRate: number | null = null;      // rate observed for the open interval
+  private fundingIntervalMs: number | null = null;    // inferred from next_funding_time deltas
+  private fundingHostileIntervals = 0;                // consecutive intervals at >= pause APR
+  private fundingAlertedForNextTime: number | null = null; // alert throttle (one per interval)
+  /** Set by assertFundingHeadroom() for monitorAllBots() to emit (the instance
+   *  can't emit directly — mirrors the autoShiftRequested field pattern). */
+  fundingAlertPending: { aprPct: number; ratePct: number; intervalHours: number; nextFundingTime: number } | null = null;
   // H.8: bootstrap guard. When placeInitialOrders() is running, the monitor()
   // tick must skip this bot, otherwise the "uncovered level" detection re-places
   // orders that are in-flight and haven't yet appeared in GRVT's openOrders.
@@ -4164,6 +4201,95 @@ export class GridBotInstance {
   }
 
   /**
+   * #7 Funding safeguard (Nivel 1, APR). Reuses the ticker monitor() already
+   * fetched — no extra request. GRVT's funding interval is per-market and can
+   * switch 1h/4h/8h (it jumps to 1h exactly when funding is hostile), so we
+   * NEVER threshold the raw per-interval rate: we infer the interval from
+   * consecutive next_funding_time values and ANNUALIZE (APR).
+   *   - ALERT (warning, no pause): the UPCOMING funding APR is hostile and
+   *     >= FUNDING_ALERT_APR_PCT. Surfaced via fundingAlertPending (consumed by
+   *     monitorAllBots), throttled to one per interval.
+   *   - PAUSE: the APPLIED funding APR stayed hostile for >= FUNDING_PAUSE_INTERVALS
+   *     consecutive intervals → throw SAFEGUARD:pause (monitorAllBots routes it).
+   * Side-aware: only reacts when funding runs AGAINST the bot's inventory side.
+   * No-op without a position (avg_entry_price = 0). Always pause, never close.
+   */
+  private assertFundingHeadroom(ticker: { funding_rate: string; next_funding_time: number }): void {
+    const rate = parseFloat(ticker.funding_rate);
+    const nextTime = Number(ticker.next_funding_time);
+    if (!Number.isFinite(rate) || !Number.isFinite(nextTime) || nextTime <= 0) return;
+
+    const hasPosition = !!this.bot.avg_entry_price && this.bot.avg_entry_price > 0;
+    const isLong = this.bot.direction !== 'short';
+    // Hostile = funding runs against our inventory side: a long pays when
+    // rate > 0, a short pays when rate < 0.
+    const hostileNow = hasPosition && ((isLong && rate > 0) || (!isLong && rate < 0));
+    // No inventory → no funding exposure: reset the streak so a re-entry starts clean.
+    if (!hasPosition) this.fundingHostileIntervals = 0;
+
+    // First observation: seed and bail — can't annualize without an interval,
+    // and no funding is charged before the first interval elapses anyway.
+    if (this.fundingPrevNextTime === null) {
+      this.fundingPrevNextTime = nextTime;
+      this.fundingPrevRate = rate;
+      return;
+    }
+
+    // Funding rollover: next_funding_time advanced → a charge just happened for
+    // the interval that ended. Evaluate the rate that was IN EFFECT then.
+    if (nextTime > this.fundingPrevNextTime) {
+      const intervalMs = nextTime - this.fundingPrevNextTime;
+      if (intervalMs >= FUNDING_INTERVAL_MIN_MS && intervalMs <= FUNDING_INTERVAL_MAX_MS) {
+        this.fundingIntervalMs = intervalMs;
+      }
+      const appliedRate = this.fundingPrevRate ?? rate;
+      const appliedHostile = hasPosition && ((isLong && appliedRate > 0) || (!isLong && appliedRate < 0));
+      let appliedApr = 0;
+      if (this.fundingIntervalMs) {
+        appliedApr = Math.abs(appliedRate) * (MS_PER_YEAR / this.fundingIntervalMs) * 100;
+        if (appliedHostile && appliedApr >= FUNDING_PAUSE_APR_PCT) {
+          this.fundingHostileIntervals += 1;
+        } else if (!appliedHostile || appliedApr < FUNDING_ALERT_APR_PCT) {
+          // Hysteresis: only clear the streak once funding cools below the
+          // lower (alert) band or flips in our favor — between bands we hold.
+          this.fundingHostileIntervals = 0;
+        }
+      }
+      this.fundingPrevNextTime = nextTime;
+      this.fundingPrevRate = rate;
+
+      if (this.fundingHostileIntervals >= FUNDING_PAUSE_INTERVALS) {
+        throw new Error(
+          `SAFEGUARD:pause:bot=${this.bot.id}:funding=${appliedApr.toFixed(0)}%APR:intervals=${this.fundingHostileIntervals}:rate=${(appliedRate * 100).toFixed(4)}%`
+        );
+      }
+    } else {
+      // Same interval still open — keep the predicted rate fresh (it can drift
+      // tick to tick until the charge lands).
+      this.fundingPrevRate = rate;
+    }
+
+    // ALERT tier (predictive): the CURRENT predicted rate annualized with the
+    // learned interval. One alert per funding interval.
+    if (
+      hostileNow &&
+      this.fundingIntervalMs &&
+      this.fundingAlertedForNextTime !== this.fundingPrevNextTime
+    ) {
+      const apr = Math.abs(rate) * (MS_PER_YEAR / this.fundingIntervalMs) * 100;
+      if (apr >= FUNDING_ALERT_APR_PCT) {
+        this.fundingAlertedForNextTime = this.fundingPrevNextTime;
+        this.fundingAlertPending = {
+          aprPct: apr,
+          ratePct: rate * 100,
+          intervalHours: this.fundingIntervalMs / 3_600_000,
+          nextFundingTime: this.fundingPrevNextTime,
+        };
+      }
+    }
+  }
+
+  /**
    * Monitorear órdenes y ejecutar lógica de round-trip
    * ⚠️ FIX CRÍTICO: Verificar fills reales con fill_history antes de asumir fills
    */
@@ -4217,6 +4343,13 @@ export class GridBotInstance {
           );
         }
       }
+    }
+
+    // 2.6. #7 FUNDING SAFEGUARD (Nivel 1, APR). Opt-in per bot. Reuses the
+    // `ticker` monitor() already fetched (funding_rate + next_funding_time) —
+    // no extra request. May throw SAFEGUARD:pause (sustained hostile funding).
+    if (this.bot.funding_safeguard_enabled) {
+      this.assertFundingHeadroom(ticker);
     }
 
     // H.2: auto-shift detection. If price is beyond the range by more
