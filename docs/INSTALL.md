@@ -87,6 +87,40 @@ docker compose --profile full up -d
 5. Caddy will automatically obtain a Let's Encrypt cert in ~30 seconds.
 6. Open `https://your-domain/dashboard/`.
 
+## Deploy on Dokploy (or another managed Docker PaaS)
+
+Use [`docker-compose.dokploy.yml`](../docker-compose.dokploy.yml) instead of the
+default compose. The only real difference: the AES **master key lives on a
+named volume** (`bot-secrets`) instead of a host bind mount, because managed
+platforms make host files awkward — and the platform's reverse proxy (Traefik
+on Dokploy) handles TLS, so there's no caddy service.
+
+1. **Create a Compose application** in Dokploy → point it at this repo, branch
+   `main`, compose file `docker-compose.dokploy.yml`.
+2. **Set the Environment** (Dokploy writes these into the `.env` the compose
+   reads): `GRVT_API_KEY`, `GRVT_API_SECRET`, `GRVT_TRADING_ACCOUNT_ID`,
+   `GRVT_TRADING_ADDRESS`, `JWT_SECRET` (32+ random chars — login fails without
+   it), `DASHBOARD_API_KEY` (64 chars), `LOG_LEVEL=info`, and optionally
+   `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Generate secrets with
+   `openssl rand -hex 32`.
+3. **Add a domain** mapped to the `bot` service on port **3848**, with HTTPS
+   enabled (Traefik gets the cert automatically).
+4. **Deploy.** The bot boots without the master key (it's read lazily).
+5. **Generate the master key once** — open the `bot` container terminal in
+   Dokploy and run:
+   ```bash
+   head -c 32 /dev/urandom > /app/secrets/master.key && chmod 600 /app/secrets/master.key
+   ```
+   **Back it up off-host immediately** (encrypted USB / password manager).
+   Losing it makes every stored GRVT credential unrecoverable. The key persists
+   on the `bot-secrets` volume across redeploys.
+6. Open `https://your-domain/dashboard/`, log in, add your GRVT credentials
+   (encrypted at rest with the master key), and create a bot. Bots are created
+   **paused** — review and Start explicitly.
+
+To enable Telegram alerts, add the `with-notifier` profile in Dokploy's compose
+settings.
+
 ## Stopping safely
 
 The bot installs a SIGTERM handler that **does not cancel any open GRVT
