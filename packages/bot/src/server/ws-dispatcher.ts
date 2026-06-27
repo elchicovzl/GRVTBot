@@ -265,6 +265,33 @@ export class WsDispatcher {
       );
     });
 
+    // Resume robustness (#6): open GRVT orders that matched no grid level were
+    // cancelled at resume before they could fill at a non-grid price and leave
+    // an unhedged position. Durable record so the operator knows a restart
+    // found (and cleaned) orphans — repeated occurrences hint at crashes
+    // mid-rotation worth investigating. Warning, not critical: nothing is
+    // broken, the orphans were auto-cleaned.
+    this.engine.on('orphanedOrders', (payload: {
+      botId: number;
+      pair: string;
+      count: number;
+      orders: Array<{ price: number; side: string; orderId: string }>;
+    }) => {
+      log.warn({ ...payload }, 'orphaned orders cancelled at resume');
+      this.persistAlert(
+        payload.botId,
+        'orphaned_orders',
+        'warning',
+        `Resume cancelled ${payload.count} orphaned order(s) on ${payload.pair} ` +
+        `(no matching grid level): ${payload.orders.map((o) => `${o.side} @ $${o.price}`).join(', ')}`
+      );
+      wsBus.publishToMany(
+        [`bot:${payload.botId}`, 'bots', 'notifications'],
+        'orphanedOrders',
+        payload
+      );
+    });
+
     // H.2: auto-shift completed. Surfaces in the dashboard's notification
     // bell so the user knows the grid moved without having to diff the
     // chart manually.

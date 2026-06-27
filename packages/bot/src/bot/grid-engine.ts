@@ -1328,6 +1328,11 @@ export class GridEngine extends EventEmitter {
 
     const gridLevels = instance.getGridLevels();
     const matchedLevelIds = new Set<number>();
+    // Open GRVT orders whose price matches NO grid level: leftovers from a
+    // crash mid-rotation, a manual order, or a cancel that failed silently
+    // before the process died. Collected here, cancelled below (before
+    // backfill) so they can't fill at a non-grid price during the resume.
+    const orphanedOrders: Array<{ orderId: string; price: number; side: 'buy' | 'sell' }> = [];
     for (const grvtOrder of openOrders) {
       const leg = (grvtOrder as any).legs?.[0];
       if (!leg) continue;
@@ -1348,6 +1353,8 @@ export class GridEngine extends EventEmitter {
           price: matchingLevel.price,
           metadata: String(clientId),
         } as any);
+      } else {
+        orphanedOrders.push({ orderId: String(grvtOrder.order_id), price, side });
       }
     }
 
@@ -1365,6 +1372,45 @@ export class GridEngine extends EventEmitter {
     log.info(
       `✅ Bot ${bot.id} resumed: ${instance.getActiveOrderCount()} órdenes mapeadas a grid levels`
     );
+
+    // ── CANCEL ORPHANED ORDERS (resume robustness, DINERO REAL) ──────────
+    // An open GRVT order whose price matches NO grid level is an orphan. Until
+    // now these survived until the first monitor tick's duplicate killer (~one
+    // interval later) — a window in which an orphan can FILL at a non-grid
+    // price and leave an UNHEDGED position. We cancel them here, at resume,
+    // BEFORE backfill, so the window is closed and the position reconciliation
+    // below sees a clean book. Safe to cancel unconditionally: an OPEN order
+    // cannot be a missed fill (a fill removes it from the open book); any
+    // position residual is handled separately by backfillFills() (#4) — #6
+    // does NOT touch position. Non-fatal: a cancel that fails is left for the
+    // monitor's duplicate killer; the resume must not abort.
+    if (orphanedOrders.length > 0) {
+      log.warn(
+        `⚠️ Bot ${bot.id}: ${orphanedOrders.length} órden(es) huérfana(s) al resume (no matchean ningún nivel) — cancelando`
+      );
+      const cancelled: typeof orphanedOrders = [];
+      for (const o of orphanedOrders) {
+        try {
+          await client.cancelOrder(o.orderId, bot.pair);
+          cancelled.push(o);
+          log.info(`🗑️ Bot ${bot.id}: orphan cancelado @ $${o.price} (${o.side}, id ${o.orderId})`);
+        } catch (err) {
+          log.warn(
+            `⚠️ Bot ${bot.id}: no se pudo cancelar orphan ${o.orderId} @ $${o.price}: ${(err as Error).message} ` +
+            `(lo barrerá el duplicate killer del monitor)`
+          );
+        }
+      }
+      if (cancelled.length > 0) {
+        // Durable alert (same emit→dispatcher→recordAlert path as positionDrift).
+        this.emit('orphanedOrders', {
+          botId: bot.id,
+          pair: bot.pair,
+          count: cancelled.length,
+          orders: cancelled.map((o) => ({ price: o.price, side: o.side, orderId: o.orderId })),
+        });
+      }
+    }
 
     // ── BACKFILL MISSED FILLS (restart/resume) ──────────────────────────
     // Rebinding by price restores the ORDER map but says nothing about
