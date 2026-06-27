@@ -23,7 +23,7 @@ import { hashPassword, verifyPassword } from '../auth/passwords.js';
 import { signToken, verifyToken } from '../auth/jwt.js';
 import { encryptCredentialFields } from '../auth/crypto.js';
 import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
-import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
+import { GRVTClient, type GrvtClientCreds, getInstrumentSpec } from '../api/client.js';
 import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { computeQtyPerLevel } from '../bot/grid-engine.js';
 import { makerFeeRate, roundTripFeeUsdt } from '../bot/fee-model.js';
@@ -2989,6 +2989,8 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         lowerPrice: hasLower ? Number(body.lower_price) : undefined,
         upperPrice: hasUpper ? Number(body.upper_price) : undefined,
         fundingRatePer8h: body.funding_rate_per_8h,
+        // Cap grids to what's creatable with this investment (min notional/grid).
+        minNotionalPerGrid: getInstrumentSpec(pair).min_notional,
       });
 
       if (!result) {

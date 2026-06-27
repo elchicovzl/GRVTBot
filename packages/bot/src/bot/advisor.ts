@@ -33,6 +33,9 @@ export interface AdvisorParams {
   windows?: number;
   /** How many ranked recommendations to return. Default 3. */
   topN?: number;
+  /** Pair's min notional per grid (from getInstrumentSpec). Caps num_grids so
+   *  the advisor never recommends a config bot creation would reject. */
+  minNotionalPerGrid?: number;
 }
 
 export interface AdvisorRecommendation {
@@ -143,19 +146,32 @@ export function runAdvisor(candles: BacktestCandle[], params: AdvisorParams): Ad
     source: 'recent',
   });
 
+  // Feasibility cap: bot creation requires >= minNotionalPerGrid per level, so
+  // num_grids can't exceed floor(investment * leverage / minNotional). Capping
+  // here means the advisor never recommends a config creation would reject.
+  const maxFeasibleGrids = params.minNotionalPerGrid && params.minNotionalPerGrid > 0
+    ? Math.floor((investmentUSDT * leverage) / params.minNotionalPerGrid)
+    : Infinity;
+
   // Candidate = (range, numGrids). Dedup configs that collapse to the same
-  // (range, numGrids) after ATR clamping.
+  // (range, numGrids) after ATR clamping / feasibility capping.
   interface Candidate { lower: number; upper: number; source: 'user' | 'recent'; numGrids: number; spacingPct: number; k: number }
   const seen = new Set<string>();
   const candidates: Candidate[] = [];
   for (const r of ranges) {
+    const mid = (r.lower + r.upper) / 2;
     for (const k of ks) {
       const atr = deriveAtrSpacing(atrCandles, r.lower, r.upper, { multiplier: k });
       if (!atr) continue;
-      const key = `${r.lower}|${r.upper}|${atr.numGrids}`;
+      // Cap to the feasible max; below 2 grids the config can't be created.
+      const numGrids = Math.min(atr.numGrids, maxFeasibleGrids);
+      if (numGrids < 2) continue;
+      // Recompute the TRUE spacing for the (possibly capped) grid count.
+      const spacingPct = mid > 0 ? ((r.upper - r.lower) / numGrids / mid) * 100 : atr.spacingPct;
+      const key = `${r.lower}|${r.upper}|${numGrids}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      candidates.push({ lower: r.lower, upper: r.upper, source: r.source, numGrids: atr.numGrids, spacingPct: atr.spacingPct, k });
+      candidates.push({ lower: r.lower, upper: r.upper, source: r.source, numGrids, spacingPct, k });
     }
   }
 
