@@ -27,6 +27,97 @@ import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
 import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { computeQtyPerLevel } from '../bot/grid-engine.js';
 import { makerFeeRate, roundTripFeeUsdt } from '../bot/fee-model.js';
+import {
+  deriveAtrSpacing,
+  DEFAULT_ATR_PERIOD, DEFAULT_ATR_INTERVAL, DEFAULT_ATR_MULTIPLIER,
+  DEFAULT_ATR_MIN_SPACING_PCT, DEFAULT_ATR_MAX_SPACING_PCT,
+  type AtrCandle, type AtrSpacingResult,
+} from '../bot/atr.js';
+
+// #8 ATR spacing: intervals allowed for the ATR computation. Sub-hour is
+// noisier for grid sizing but permitted; very short intervals are not.
+const ATR_VALID_INTERVALS = new Set([
+  'CI_5_M', 'CI_15_M', 'CI_30_M',
+  'CI_1_H', 'CI_2_H', 'CI_4_H', 'CI_6_H', 'CI_8_H', 'CI_12_H', 'CI_1_D',
+]);
+
+interface AtrResolution {
+  numGrids: number;
+  atr: AtrSpacingResult;
+  params: {
+    atr_spacing: true;
+    atr_period: number;
+    atr_interval: string;
+    atr_multiplier: number;
+    atr_min_spacing_pct: number;
+    atr_max_spacing_pct: number;
+  };
+}
+
+/**
+ * #8: when body.atr_spacing is on, fetch candles and derive num_grids from
+ * ATR (STATIC at creation — the grid is fixed-spacing thereafter). Returns
+ * null when atr_spacing is off. Throws { atrError } (callers map to a 400) on
+ * bad params or insufficient candle data.
+ */
+async function resolveAtrSpacing(
+  client: { getKlines(i: string, iv?: string, l?: number): Promise<unknown[]> },
+  body: any,
+  pair: string,
+  lower: number,
+  upper: number
+): Promise<AtrResolution | null> {
+  if (body?.atr_spacing !== true) return null;
+
+  const interval = String(body.atr_interval ?? DEFAULT_ATR_INTERVAL);
+  const period = body.atr_period != null ? Number(body.atr_period) : DEFAULT_ATR_PERIOD;
+  const multiplier = body.atr_multiplier != null ? Number(body.atr_multiplier) : DEFAULT_ATR_MULTIPLIER;
+  const minSpacingPct = body.atr_min_spacing_pct != null ? Number(body.atr_min_spacing_pct) : DEFAULT_ATR_MIN_SPACING_PCT;
+  const maxSpacingPct = body.atr_max_spacing_pct != null ? Number(body.atr_max_spacing_pct) : DEFAULT_ATR_MAX_SPACING_PCT;
+
+  if (!ATR_VALID_INTERVALS.has(interval)) {
+    throw { atrError: `atr_interval must be one of: ${[...ATR_VALID_INTERVALS].join(', ')}` };
+  }
+  if (!Number.isInteger(period) || period < 2 || period > 100) {
+    throw { atrError: 'atr_period must be an integer between 2 and 100' };
+  }
+  if (!(multiplier > 0) || multiplier > 5) {
+    throw { atrError: 'atr_multiplier must be > 0 and <= 5' };
+  }
+  if (!(minSpacingPct > 0) || minSpacingPct > 50) {
+    throw { atrError: 'atr_min_spacing_pct must be > 0 and <= 50' };
+  }
+  if (!(maxSpacingPct >= minSpacingPct) || maxSpacingPct > 50) {
+    throw { atrError: 'atr_max_spacing_pct must be >= atr_min_spacing_pct and <= 50' };
+  }
+
+  // Enough candles for the Wilder seed + smoothing (period*5, bounded 100..1000).
+  const limit = Math.min(1000, Math.max(100, period * 5));
+  const rows = await client.getKlines(pair, interval, limit);
+  // GRVT returns newest-first; ATR needs ascending (oldest→newest).
+  const candles: AtrCandle[] = (rows as any[])
+    .slice()
+    .reverse()
+    .map((r) => ({ high: Number(r.high), low: Number(r.low), close: Number(r.close) }));
+
+  const atr = deriveAtrSpacing(candles, lower, upper, { period, multiplier, minSpacingPct, maxSpacingPct });
+  if (!atr) {
+    throw { atrError: 'could not compute ATR — insufficient candle data for the requested period' };
+  }
+
+  return {
+    numGrids: atr.numGrids,
+    atr,
+    params: {
+      atr_spacing: true,
+      atr_period: period,
+      atr_interval: interval,
+      atr_multiplier: multiplier,
+      atr_min_spacing_pct: minSpacingPct,
+      atr_max_spacing_pct: maxSpacingPct,
+    },
+  };
+}
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -1999,6 +2090,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       num_grids: number;
       investment_usdt: number;
       leverage: number;
+      // #8 ATR spacing (opt-in). When atr_spacing=true, num_grids is DERIVED
+      // from ATR and the provided num_grids is ignored.
+      atr_spacing: boolean;
+      atr_period: number;
+      atr_interval: string;
+      atr_multiplier: number;
+      atr_min_spacing_pct: number;
+      atr_max_spacing_pct: number;
     }>;
 
     const errors: string[] = [];
@@ -2007,7 +2106,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const direction = body.direction === 'short' ? 'short' : 'long';
     const lower = Number(body.lower_price);
     const upper = Number(body.upper_price);
-    const grids = Number(body.num_grids);
+    let grids = Number(body.num_grids);
     const investment = Number(body.investment_usdt);
     const leverage = Number(body.leverage);
 
@@ -2015,6 +2114,21 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const virtualEnabledVal = (body as any).virtual_enabled === true;
     const activeWindowSizeVal = Number((body as any).active_window_size);
     const maxGrids = virtualEnabledVal ? 500 : 95;
+
+    // #8 ATR spacing (opt-in): derive num_grids from ATR BEFORE validating it,
+    // so the rest of the preview (spacing, qty, profit) reflects the derived
+    // grid. Needs a valid range; otherwise we skip and let the normal range
+    // validation report the error.
+    let atrResult: AtrSpacingResult | null = null;
+    if (body.atr_spacing === true && Number.isFinite(lower) && Number.isFinite(upper) && lower < upper) {
+      try {
+        const resolved = await resolveAtrSpacing(grvtClient, body, pair, lower, upper);
+        if (resolved) { grids = resolved.numGrids; atrResult = resolved.atr; }
+      } catch (e: any) {
+        if (e?.atrError) return res.status(400).json({ error: 'validation_failed', errors: [e.atrError] });
+        throw e;
+      }
+    }
 
     if (!Number.isFinite(lower) || lower <= 0) errors.push('lower_price must be > 0');
     if (!Number.isFinite(upper) || upper <= 0) errors.push('upper_price must be > 0');
@@ -2091,9 +2205,24 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         liquidationEstimate: round(liquidationEstimate, 2),
         liqDistancePct: round(liqDistancePct, 2),
       },
+      // #8: present the ATR derivation so the wizard can show WHY num_grids is
+      // what it is (and the user can backtest the derived grid before creating).
+      atr: atrResult ? {
+        derivedNumGrids: grids,
+        atr: round(atrResult.atr, 4),
+        atrPct: round(atrResult.atrPct, 3),
+        rawSpacingPct: round(atrResult.rawSpacingPct, 3),
+        spacingPct: round(atrResult.spacingPct, 3),
+        spacingAbs: round(atrResult.spacingAbs, 4),
+        floorPct: round(atrResult.floorPct, 3),
+        clampedAtFloor: atrResult.clampedAtFloor,
+        clampedAtCap: atrResult.clampedAtCap,
+      } : null,
       warnings: [
         ...(overOrderCap ? ['num_grids over GRVT Tier 1 cap (95)'] : []),
         ...(leverage > 20 ? ['leverage > 20x: liquidation risk is high'] : []),
+        ...(atrResult?.clampedAtFloor ? ['ATR spacing clamped UP to the floor (low volatility / fee floor)'] : []),
+        ...(atrResult?.clampedAtCap ? ['ATR spacing clamped DOWN to the cap (high volatility)'] : []),
       ],
     });
     return;
@@ -2132,6 +2261,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       active_window_size: number;
       // H.5: optional sub-account routing. Null/missing = default creds.
       grvt_sub_account_id: number | null;
+      // #8 ATR spacing (opt-in). When atr_spacing=true, num_grids is DERIVED
+      // from ATR at creation; the grid stays fixed-spacing thereafter.
+      atr_spacing: boolean;
+      atr_period: number;
+      atr_interval: string;
+      atr_multiplier: number;
+      atr_min_spacing_pct: number;
+      atr_max_spacing_pct: number;
     }>;
 
     const errors: string[] = [];
@@ -2140,7 +2277,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const direction = body.direction === 'short' ? 'short' : 'long';
     const lower = Number(body.lower_price);
     const upper = Number(body.upper_price);
-    const grids = Number(body.num_grids);
+    let grids = Number(body.num_grids);
     const investment = Number(body.investment_usdt);
     const leverage = Number(body.leverage);
 
@@ -2148,6 +2285,20 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const virtualEnabled = body.virtual_enabled === true;
     const activeWindowSize = Number(body.active_window_size);
     const maxGridsPost = virtualEnabled ? 500 : 95;
+
+    // #8 ATR spacing (opt-in): derive num_grids from ATR before validating it.
+    // Persisted into params_json after creation for audit (so it's clear later
+    // WHY this bot's num_grids is what it is).
+    let atrResolved: AtrResolution | null = null;
+    if (body.atr_spacing === true && Number.isFinite(lower) && Number.isFinite(upper) && lower < upper) {
+      try {
+        atrResolved = await resolveAtrSpacing(grvtClient, body, pair, lower, upper);
+        if (atrResolved) grids = atrResolved.numGrids;
+      } catch (e: any) {
+        if (e?.atrError) return res.status(400).json({ error: 'validation_failed', errors: [e.atrError] });
+        throw e;
+      }
+    }
 
     if (!Number.isFinite(lower) || lower <= 0) errors.push('lower_price must be > 0');
     if (!Number.isFinite(upper) || upper <= 0) errors.push('upper_price must be > 0');
@@ -2252,6 +2403,26 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         grvtSubAccountId,
       });
       log.info({ botId, userId, pair, direction, leverage, grids }, 'bot created (paused)');
+
+      // #8: persist the ATR derivation into params_json (audit trail). The
+      // engine already wrote spacing/qty there; merge, don't clobber.
+      if (atrResolved) {
+        const row = await dbGet<{ params_json: string | null }>(
+          db, `SELECT params_json FROM grid_bots WHERE id = ?`, [botId]
+        );
+        let params: Record<string, unknown> = {};
+        try { params = row?.params_json ? JSON.parse(row.params_json) : {}; } catch { params = {}; }
+        Object.assign(params, atrResolved.params, {
+          atr_derived_num_grids: atrResolved.numGrids,
+          atr_spacing_pct: atrResolved.atr.spacingPct,
+          atr_value: atrResolved.atr.atr,
+        });
+        await dbRun(db, `UPDATE grid_bots SET params_json = ? WHERE id = ?`, [JSON.stringify(params), botId]);
+        log.info(
+          { botId, numGrids: atrResolved.numGrids, spacingPct: atrResolved.atr.spacingPct, ...atrResolved.params },
+          'ATR spacing derived at bot creation'
+        );
+      }
 
       // Persist per-bot risk acceptance if the dashboard sent the
       // exact text + version it showed. The text is hashed and the

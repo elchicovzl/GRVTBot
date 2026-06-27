@@ -305,6 +305,86 @@ describe('POST /api/v2/bots/:id/range — F1.1 refusal propagation', () => {
   });
 });
 
+describe('POST /api/v2/bots/validate — #8 ATR spacing (opt-in)', () => {
+  // 30 candles, each TR = 63 (3% of mid 2100) → ATR = 63 → atrPct = 3%.
+  // k=0.6 → spacing 1.8% → spacingAbs 37.8 → numGrids round(600/37.8) = 16.
+  const atrCandles = Array.from({ length: 30 }, () => ({
+    high: 2131.5, low: 2068.5, close: 2100, open: 2100, volume: 1, trades: 1,
+  }));
+  const basePayload = {
+    pair: 'ETH_USDT_Perp',
+    direction: 'long' as const,
+    lower_price: 1800,
+    upper_price: 2400,
+    num_grids: 99, // ignored when atr_spacing=true — derived from ATR instead
+    investment_usdt: 500,
+    leverage: 2,
+  };
+
+  it('derives num_grids from ATR and reports the derivation', async () => {
+    const { app, grvtClient } = createTestApp();
+    grvtClient.getKlines.mockResolvedValue(atrCandles);
+
+    const res = await request(app)
+      .post('/api/v2/bots/validate')
+      .set('X-Api-Key', API_KEY)
+      .send({ ...basePayload, atr_spacing: true, atr_multiplier: 0.6 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.atr).toBeTruthy();
+    expect(res.body.atr.spacingPct).toBeCloseTo(1.8, 2);
+    expect(res.body.atr.derivedNumGrids).toBe(16);
+    expect(res.body.atr.clampedAtFloor).toBe(false);
+    expect(res.body.atr.clampedAtCap).toBe(false);
+    // The rest of the preview reflects the DERIVED grid (16), not the input
+    // (99). The validate endpoint's display spacing uses (upper-lower)/(grids-1)
+    // so it differs slightly from the ATR target (1.8%) — what matters is it's
+    // computed off 16, not 99 (which would give ~0.3%).
+    expect(res.body.input.grids).toBe(16);
+    expect(res.body.computed.spacingPct).toBeGreaterThan(1.5);
+    expect(grvtClient.getKlines).toHaveBeenCalled();
+  });
+
+  it('rejects bad ATR params with a 400', async () => {
+    const { app, grvtClient } = createTestApp();
+    grvtClient.getKlines.mockResolvedValue(atrCandles);
+
+    const res = await request(app)
+      .post('/api/v2/bots/validate')
+      .set('X-Api-Key', API_KEY)
+      .send({ ...basePayload, atr_spacing: true, atr_multiplier: 99 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.errors.join(' ')).toMatch(/atr_multiplier/);
+  });
+
+  it('400s when there are not enough candles to compute ATR', async () => {
+    const { app, grvtClient } = createTestApp();
+    grvtClient.getKlines.mockResolvedValue(atrCandles.slice(0, 5)); // < period+1
+
+    const res = await request(app)
+      .post('/api/v2/bots/validate')
+      .set('X-Api-Key', API_KEY)
+      .send({ ...basePayload, atr_spacing: true });
+
+    expect(res.status).toBe(400);
+    expect(res.body.errors.join(' ')).toMatch(/ATR/i);
+  });
+
+  it('is a no-op when atr_spacing is not set (uses the provided num_grids)', async () => {
+    const { app, grvtClient } = createTestApp();
+    const res = await request(app)
+      .post('/api/v2/bots/validate')
+      .set('X-Api-Key', API_KEY)
+      .send({ ...basePayload, num_grids: 10 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.atr).toBeNull();
+    expect(res.body.input.grids).toBe(10);
+    expect(grvtClient.getKlines).not.toHaveBeenCalled();
+  });
+});
+
 describe('POST /api/v2/bots/validate — F1.2 net profit per round-trip', () => {
   const payload = {
     pair: 'ETH_USDT_Perp',
