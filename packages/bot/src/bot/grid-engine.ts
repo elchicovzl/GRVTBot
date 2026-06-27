@@ -589,6 +589,13 @@ const MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000;
 const FUNDING_INTERVAL_MIN_MS = 30 * 60 * 1000;        // 30m
 const FUNDING_INTERVAL_MAX_MS = 24 * 60 * 60 * 1000;   // 24h
 
+// #11: max number of per-bot monitor ticks running CONCURRENTLY per sweep.
+// Per-bot ticks are independent (different GRVT accounts / DB rows) and the
+// per-user rate limiter (#12) absorbs the API concurrency, but a bounded pool
+// still prevents a fleet of bots from stampeding the CPU / event loop. Env-
+// overridable. 1 = the old fully-sequential behavior.
+const MONITOR_CONCURRENCY = envTunable('GRVT_MONITOR_CONCURRENCY', 8);
+
 /**
  * Local estimate of liquidation price for the safeguard check. Uses the
  * bot's current avg_entry_price (updated on every fill) and leverage,
@@ -1892,7 +1899,15 @@ export class GridEngine extends EventEmitter {
   private async monitorAllBots(): Promise<void> {
     if (!this.isRunning) return;
 
-    for (const [botId, instance] of this.bots) {
+    // #11: tick every bot CONCURRENTLY through a bounded pool. Per-bot ticks
+    // are independent (different GRVT accounts / DB rows) and the per-user
+    // rate limiter (#12) absorbs the API concurrency. Each tick is fully
+    // isolated below (its own try/catch/finally), so one bot throwing never
+    // blocks or fails another. Snapshot the entries first so a pause/close
+    // that mutates this.bots mid-sweep doesn't disturb the iteration.
+    const tickEntries = [...this.bots.entries()];
+    let tickCursor = 0;
+    const tickOne = async (botId: number, instance: GridBotInstance): Promise<void> => {
       // Skip bots currently undergoing a long-running mutation
       // (updateBotRange). Without this skip the monitor would race
       // against the mutation: it would see partially-deleted levels,
@@ -1900,7 +1915,7 @@ export class GridEngine extends EventEmitter {
       // mutation is also trying to place — duplicates, fights, lost
       // money. The mutex is released in the mutation's finally block.
       if (this.bumpInProgress.has(botId)) {
-        continue;
+        return;
       }
       // Backfill on detected connectivity gap: if the last SUCCESSFUL
       // monitor tick is older than the live fill-detection lookback
@@ -1990,7 +2005,18 @@ export class GridEngine extends EventEmitter {
         // G.5: last-tick duration gauge + stall counter (>10s).
         botMetrics.recordTick(botId, instance.getBot().pair, Date.now() - tickStart);
       }
-    }
+    };
+    // Bounded worker pool: at most MONITOR_CONCURRENCY ticks in flight, each
+    // worker pulling the next bot off the snapshot until they're all done.
+    const tickWorker = async (): Promise<void> => {
+      while (tickCursor < tickEntries.length) {
+        const [botId, instance] = tickEntries[tickCursor++]!;
+        await tickOne(botId, instance);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(MONITOR_CONCURRENCY, tickEntries.length) }, () => tickWorker())
+    );
 
     // H.2: process auto-shift requests. Rate-limited to max once per
     // hour per bot via last_auto_shift_at column (persisted so the
