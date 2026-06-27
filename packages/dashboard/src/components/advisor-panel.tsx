@@ -23,9 +23,10 @@ const L = {
     needInputs: 'Completá par, inversión y leverage primero.',
     failed: 'No se pudo analizar',
     regime: 'Régimen',
-    verdictRecommend: 'Recomendado: el régimen es favorable para un grid.',
-    verdictCaution: 'Precaución: hay tendencia a favor — un grid puede quedar rezagado.',
-    verdictNoGo: 'No recomendado: la tendencia va en contra de este grid. Considerá cambiar dirección, ampliar el rango, o no correrlo.',
+    vrFavorable: 'Recomendado: el régimen es favorable y el backtest aguanta.',
+    vrWeak: 'No recomendado: los candidatos perdieron en TODAS las ventanas del backtest. La robustez es pobre acá — mirá los números.',
+    vrAgainst: 'No recomendado: la tendencia va en contra de este grid. Considerá cambiar dirección, ampliar el rango, o no correrlo.',
+    vrWithTrend: 'Precaución: hay tendencia a favor — un grid puede quedar rezagado.',
     grids: 'grids',
     spacing: 'spacing',
     worst: 'peor caso',
@@ -49,9 +50,10 @@ const L = {
     needInputs: 'Fill pair, investment and leverage first.',
     failed: 'Analysis failed',
     regime: 'Regime',
-    verdictRecommend: 'Recommended: the regime favors a grid.',
-    verdictCaution: 'Caution: there is a trend with the grid — it may lag a runaway move.',
-    verdictNoGo: 'Not recommended: the trend runs against this grid. Consider switching direction, widening the range, or not running it.',
+    vrFavorable: 'Recommended: the regime favors a grid and the backtest holds up.',
+    vrWeak: 'Not recommended: candidates lost in EVERY backtest window — robustness is poor here. Look at the numbers.',
+    vrAgainst: 'Not recommended: the trend runs against this grid. Consider switching direction, widening the range, or not running it.',
+    vrWithTrend: 'Caution: there is a trend with the grid — it may lag a runaway move.',
     grids: 'grids',
     spacing: 'spacing',
     worst: 'worst case',
@@ -123,8 +125,14 @@ export function AdvisorPanel({ input, onApply }: AdvisorPanelProps) {
           {/* Verdict + regime */}
           <div className={cn('rounded-md border px-3 py-2 text-xs', VERDICT_STYLE[result.verdict])}>
             <div className="flex items-center gap-1.5 font-medium">
-              {result.verdict === 'no_go' ? <AlertTriangle className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
-              {result.verdict === 'recommend' ? m.verdictRecommend : result.verdict === 'caution' ? m.verdictCaution : m.verdictNoGo}
+              {result.verdict === 'recommend' ? <Check className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
+              {result.verdictReason === 'favorable'
+                ? m.vrFavorable
+                : result.verdictReason === 'weak_backtest'
+                  ? m.vrWeak
+                  : result.verdictReason === 'regime_with_trend'
+                    ? m.vrWithTrend
+                    : m.vrAgainst}
             </div>
             <div className="mt-1 text-2xs opacity-80">
               {m.regime}: <Mono>{result.regime.state}</Mono> · ER <Mono>{result.regime.efficiencyRatio.toFixed(2)}</Mono> · trend <Mono>{result.regime.trendPct.toFixed(1)}%</Mono>

@@ -340,6 +340,8 @@ export interface AdvisorResult {
     window: number;
   };
   verdict: 'recommend' | 'caution' | 'no_go';
+  /** Why the verdict landed where it did — drives the panel copy. */
+  verdictReason: 'favorable' | 'regime_against' | 'regime_with_trend' | 'weak_backtest';
   recommendations: AdvisorRecommendation[];
   assumptions: {
     lookbackCandles: number;

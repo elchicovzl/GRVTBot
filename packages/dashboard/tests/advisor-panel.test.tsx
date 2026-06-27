@@ -25,6 +25,7 @@ const REC: AdvisorRecommendation = {
 const RESULT: AdvisorResult = {
   regime: { state: 'range', efficiencyRatio: 0.05, trendPct: -3.1, window: 540 },
   verdict: 'recommend',
+  verdictReason: 'favorable',
   recommendations: [REC],
   assumptions: { lookbackCandles: 540, windows: 3, fundingRatePer8h: 0.0001, fundingModel: 'constant per-8h (GRVT publishes no historical funding rate)', candidatesEvaluated: 4 },
 };
@@ -63,10 +64,19 @@ describe('AdvisorPanel', () => {
     expect(onApply).toHaveBeenCalledWith(REC);
   });
 
-  it('shows a no_go verdict prominently', async () => {
-    runAdvisor.mockResolvedValue({ ...RESULT, verdict: 'no_go', regime: { ...RESULT.regime, state: 'trend_down' } });
+  it('flips a "range" regime to no_go when the backtest lost in every window (the prod fix)', async () => {
+    // The exact trap caught live: regime classified "range" (green-ish gate)
+    // but every candidate lost → verdict no_go with a weak_backtest reason.
+    runAdvisor.mockResolvedValue({
+      ...RESULT,
+      verdict: 'no_go',
+      verdictReason: 'weak_backtest',
+      recommendations: [{ ...REC, robustness: { ...REC.robustness, meanRetPct: -1.9, winRatePct: 0 }, confidence: 'low' }],
+    });
     wrap(<AdvisorPanel input={INPUT} onApply={() => {}} />);
     fireEvent.click(screen.getByRole('button'));
-    await waitFor(() => expect(screen.getByText(/not recommended|no recomendado/i)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/every backtest window|todas las ventanas/i)).toBeInTheDocument()
+    );
   });
 });
