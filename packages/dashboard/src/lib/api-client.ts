@@ -20,6 +20,8 @@ import {
   type HealthV2,
   type BacktestInput,
   type BacktestResult,
+  type AdvisorInput,
+  type AdvisorResult,
   type OrderRow,
   type PortfolioEquityPoint,
   type PortfolioSummary,
@@ -203,6 +205,13 @@ export const api = {
 
   validateBot: (input: ValidateBotInput) =>
     request<ValidateBotResult>('/bots/validate', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  // Config advisor: ranked, regime-gated grid recommendations. No orders.
+  runAdvisor: (input: AdvisorInput) =>
+    request<AdvisorResult>('/bots/advisor', {
       method: 'POST',
       body: JSON.stringify(input),
     }),

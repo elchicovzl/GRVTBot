@@ -22,13 +22,14 @@ import { Input } from './primitives/input';
 import { Mono } from './primitives/mono';
 import { api } from '@/lib/api-client';
 import { RangePickerChart } from './charts/range-picker-chart';
+import { AdvisorPanel } from './advisor-panel';
 import {
   formatPercent,
   formatPnl,
   formatSize,
   formatUsd,
 } from '@/lib/format';
-import type { ValidateBotInput, ValidateBotResult } from '@/lib/api-types';
+import type { ValidateBotInput, ValidateBotResult, AdvisorInput } from '@/lib/api-types';
 import { cn } from '@/lib/cn';
 import { useT } from '@/i18n';
 
@@ -614,6 +615,25 @@ function StepConfig({
   update: <K extends keyof WizardState>(k: K, v: WizardState[K]) => void;
 }) {
   const t = useT();
+  // Build the advisor input from the current form. Range is optional (the
+  // advisor proposes one if absent); null disables the advisor button until
+  // pair + investment + leverage are valid.
+  const inv = parseFloat(state.investment);
+  const lev = parseInt(state.leverage, 10);
+  const lo = parseFloat(state.lower);
+  const hi = parseFloat(state.upper);
+  const advisorInput: AdvisorInput | null =
+    state.pair && Number.isFinite(inv) && inv > 0 && Number.isFinite(lev) && lev >= 1
+      ? {
+          pair: state.pair,
+          direction: state.direction,
+          investment_usdt: inv,
+          leverage: lev,
+          ...(Number.isFinite(lo) && Number.isFinite(hi) && lo > 0 && hi > lo
+            ? { lower_price: lo, upper_price: hi }
+            : {}),
+        }
+      : null;
   return (
     <div>
       <h3 className="text-sm font-semibold text-text-primary mb-3">
@@ -644,6 +664,17 @@ function StepConfig({
           helper={state.virtualEnabled ? '2 – 500 (virtual)' : '2 – 95'}
         />
       </div>
+
+      {/* Config advisor (V1c): backtest-ranked recommendations. Apply fills
+          range + grids; the user can ignore it and configure manually. */}
+      <AdvisorPanel
+        input={advisorInput}
+        onApply={(rec) => {
+          update('lower', String(rec.config.lowerPrice));
+          update('upper', String(rec.config.upperPrice));
+          update('grids', String(rec.config.numGrids));
+        }}
+      />
 
       {/* H.8: Virtual grids */}
       <div className="mt-4 rounded-md border border-border-subtle bg-bg-muted/40 p-4">
