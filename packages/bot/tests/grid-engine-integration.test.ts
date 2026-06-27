@@ -1129,6 +1129,49 @@ describe('monitor(): #7 funding safeguard (APR-based)', () => {
   });
 });
 
+// ── 5c. #11 Concurrent per-bot ticks ─────────────────────────────────
+
+describe('monitorAllBots(): #11 parallel ticks', () => {
+  it('ticks bots CONCURRENTLY, not one-at-a-time', async () => {
+    // Proof by barrier: every bot's tick blocks inside getTicker until ALL of
+    // them have entered. If ticks were sequential, bot #2 would never enter
+    // (bot #1 is stuck waiting) and the barrier would deadlock → test times
+    // out. Under the parallel pool all N enter at once and the barrier opens.
+    const N = 3;
+    const { db } = setupWorld();
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let openBarrier!: () => void;
+    const barrier = new Promise<void>((r) => { openBarrier = r; });
+
+    const instances: Array<[number, GridBotInstance]> = [];
+    for (let i = 1; i <= N; i++) {
+      db.addBot(makeBot({ id: i }));
+      const client = new FakeGrvtClient();
+      client.price = 2008;
+      const realGetTicker = client.getTicker.bind(client);
+      client.getTicker = async (p: string) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        if (inFlight >= N) openBarrier(); // last one in opens the gate
+        await barrier;
+        const t = await realGetTicker(p);
+        inFlight--;
+        return t;
+      };
+      instances.push([i, new GridBotInstance(db.bots.get(i) as any, client as any)]);
+    }
+
+    const engine = makeEngine(instances);
+    await (engine as any).monitorAllBots();
+
+    // All three ticks were in flight simultaneously.
+    expect(maxInFlight).toBe(N);
+    expect((engine as any).bots.size).toBe(N); // none paused — all ticked cleanly
+  });
+});
+
 describe('monitorAllBots(): error isolation', () => {
   it('one bot throwing a non-SAFEGUARD error does not prevent other bots from being monitored', async () => {
     const { db } = setupWorld();
