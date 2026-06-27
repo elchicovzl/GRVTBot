@@ -52,10 +52,22 @@ export function aggregateWindows(results: WindowResult[]): RobustnessStats | nul
 
 /**
  * Comparator for ranking candidates by ROBUSTNESS (use with Array.sort, best
- * first). Priority: worst-case return (survival) → win-rate → mean return.
+ * first).
+ *
+ * VIABILITY FIRST: a config with positive expectancy (mean return > 0) always
+ * ranks above one without it. Without this, pure worst-case ordering puts a
+ * config that NEVER wins (shallow worst-case, mean ≤ 0) above one that wins
+ * most windows with a much better mean but a deeper single-window worst-case —
+ * burying the actually-profitable answer (caught live: a narrow losing range
+ * outranked a wide profitable one).
+ *
+ * WITHIN a viability group: worst-case return (survival) → win-rate → mean.
  * Peak/best return is deliberately NOT a ranking key — chasing it overfits.
  */
 export function compareRobustness(a: RobustnessStats, b: RobustnessStats): number {
+  const aViable = a.meanRetPct > 0;
+  const bViable = b.meanRetPct > 0;
+  if (aViable !== bViable) return aViable ? -1 : 1; // profitable first
   if (a.worstRetPct !== b.worstRetPct) return b.worstRetPct - a.worstRetPct;
   if (a.winRatePct !== b.winRatePct) return b.winRatePct - a.winRatePct;
   return b.meanRetPct - a.meanRetPct;

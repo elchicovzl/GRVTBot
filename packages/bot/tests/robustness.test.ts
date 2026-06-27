@@ -43,6 +43,15 @@ describe('compareRobustness', () => {
     const B = mk(-10, 50, 9);
     expect([B, A].sort(compareRobustness)[0]).toBe(A);
   });
+
+  it('ranks a PROFITABLE config above a losing one even with a deeper worst-case', () => {
+    // The live bug: a narrow range that NEVER wins (mean ≤ 0, shallow worst)
+    // outranked a wide range that wins most windows (deep worst, big mean).
+    // Viability must come first.
+    const profitable = mk(-30, 67, 15); // deep worst, but net positive
+    const losing = mk(-5, 0, -2);        // shallow worst, but never wins
+    expect([losing, profitable].sort(compareRobustness)[0]).toBe(profitable);
+  });
 });
 
 describe('confidenceBucket', () => {

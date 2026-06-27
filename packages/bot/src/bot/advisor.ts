@@ -54,9 +54,14 @@ export interface AdvisorRecommendation {
   equityCurve?: Array<{ time: number; equity: number }>;
 }
 
+/** Why the verdict landed where it did — drives the UI copy. */
+export type AdvisorReason = 'favorable' | 'regime_against' | 'regime_with_trend' | 'weak_backtest';
+
 export interface AdvisorResult {
   regime: { state: RegimeState; efficiencyRatio: number; trendPct: number; window: number };
   verdict: AdvisorVerdict;
+  /** Dominant cause of the verdict (regime vs backtest evidence). */
+  verdictReason: AdvisorReason;
   recommendations: AdvisorRecommendation[];
   assumptions: {
     lookbackCandles: number;
@@ -69,6 +74,21 @@ export interface AdvisorResult {
 
 const DEFAULT_KS = [0.6, 0.8, 1.0, 1.5];
 const MIN_WINDOW_CANDLES = 30;
+
+const VERDICT_SEVERITY: Record<AdvisorVerdict, number> = { recommend: 0, caution: 1, no_go: 2 };
+
+/**
+ * Verdict implied by the BEST candidate's backtest evidence — independent of
+ * the regime label. This is the fix for the trap where the regime gate calls a
+ * choppy −33% market "range" (low efficiency ratio) and says "recommend" while
+ * every candidate actually LOST in every window. Evidence overrides heuristic.
+ */
+export function robustnessVerdict(best: RobustnessStats | undefined): AdvisorVerdict {
+  if (!best) return 'caution';                          // no scoring → can't endorse
+  if (best.meanRetPct <= 0 || best.winRatePct === 0) return 'no_go'; // loses on average / never wins
+  if (best.winRatePct < 50 || best.worstRetPct <= -20 || confidenceBucket(best) === 'low') return 'caution';
+  return 'recommend';
+}
 
 /** Split candles into up to `n` consecutive sub-windows (each >= MIN_WINDOW_CANDLES). */
 function splitWindows(candles: BacktestCandle[], n: number): BacktestCandle[][] {
@@ -107,7 +127,8 @@ export function runAdvisor(candles: BacktestCandle[], params: AdvisorParams): Ad
   // ── GATE: regime + go/no-go on the chosen direction ────────────────
   const regime = classifyRegime(closes);
   if (!regime) return null;
-  const verdict = gridVerdict(regime.state, direction);
+  // Regime-based verdict (heuristic). Combined with the backtest evidence below.
+  const gateVerdict = gridVerdict(regime.state, direction);
 
   // ── GENERATE: range options × ATR k → candidate configs ────────────
   const recentLow = Math.min(...candles.map((c) => c.low));
@@ -153,6 +174,19 @@ export function runAdvisor(candles: BacktestCandle[], params: AdvisorParams): Ad
 
   scored.sort((a, b) => compareRobustness(a.stats, b.stats));
 
+  // ── VERDICT: the WORSE of the regime gate and the backtest evidence ─
+  // A green "recommend" must never survive a best candidate that lost in every
+  // window. Evidence (robustness of the top pick) overrides the regime label.
+  const bestStats = scored[0]?.stats;
+  const robV = robustnessVerdict(bestStats);
+  const verdict: AdvisorVerdict =
+    VERDICT_SEVERITY[robV] > VERDICT_SEVERITY[gateVerdict] ? robV : gateVerdict;
+  let verdictReason: AdvisorReason;
+  if (gateVerdict === 'no_go') verdictReason = 'regime_against';            // regime trend against the grid
+  else if (VERDICT_SEVERITY[robV] >= VERDICT_SEVERITY[gateVerdict] && robV !== 'recommend') verdictReason = 'weak_backtest';
+  else if (gateVerdict === 'caution') verdictReason = 'regime_with_trend';
+  else verdictReason = 'favorable';
+
   // ── BUILD recommendations ──────────────────────────────────────────
   const recommendations: AdvisorRecommendation[] = scored.slice(0, topN).map((s, i) => {
     const codes = [
@@ -190,6 +224,7 @@ export function runAdvisor(candles: BacktestCandle[], params: AdvisorParams): Ad
   return {
     regime: { state: regime.state, efficiencyRatio: regime.efficiencyRatio, trendPct: regime.trendPct, window: regime.window },
     verdict,
+    verdictReason,
     recommendations,
     assumptions: {
       lookbackCandles: candles.length,
