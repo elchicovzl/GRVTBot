@@ -21,6 +21,15 @@ import { GRVT_MARKET_DATA_BASE_URL, GRVT_TRADING_BASE_URL } from './grvt-config.
 const MARKET_DATA_URL = GRVT_MARKET_DATA_BASE_URL;
 const TRADING_URL = GRVT_TRADING_BASE_URL;
 
+/**
+ * True when a GRVT error means the leverage-setting API was DEPRECATED (HTTP
+ * 400 code 2106), as opposed to a real rejection. GRVT removed leverage-by-API;
+ * callers treat this as non-fatal (leverage is managed by GRVT margin/UI).
+ */
+export function isDeprecatedLeverageError(msg: string): boolean {
+  return /"?code"?\s*:?\s*2106\b/.test(msg) || /deprecated/i.test(msg);
+}
+
 // Tipos para las respuestas de la API
 export interface Balance {
   sub_account_id: string;
@@ -754,17 +763,22 @@ export class GRVTClient {
   /**
    * Establecer leverage para un instrumento
    */
-  async setLeverage(instrument: string, leverage: number): Promise<boolean> {
+  /**
+   * Set the instrument's initial leverage. Returns:
+   *   'ok'         — applied (or a 200 without an explicit failure).
+   *   'deprecated' — GRVT removed the leverage API (code 2106). No replacement
+   *                  endpoint: leverage is managed by GRVT (margin mode / UI).
+   *                  Callers treat this as NON-fatal.
+   *   'rejected'   — a real failure (404, business rejection, success=false).
+   */
+  async setLeverage(instrument: string, leverage: number): Promise<'ok' | 'deprecated' | 'rejected'> {
     await this.rateLimit();
 
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
 
     try {
-      // GRVT's real endpoint is set_initial_leverage. /set_leverage does NOT
-      // exist and returns HTTP 404 — which the old catch surfaced as "GRVT
-      // rejected", disguising a wrong-endpoint bug as a business rejection and
-      // making EVERY fresh bot start fail. Confirmed against the official SDK
-      // (ApiSetInitialLeverageRequest: sub_account_id, instrument, leverage str).
+      // GRVT's endpoint is set_initial_leverage (set_leverage 404s — confirmed
+      // against the official SDK: sub_account_id, instrument, leverage string).
       const res = await this.authedRequest(`${TRADING_URL}/set_initial_leverage`, {
         sub_account_id: this.tradingAccountId,
         instrument: instrument,
@@ -774,16 +788,27 @@ export class GRVTClient {
       // success=false must NOT be read as "applied" (fail-closed on DINERO REAL).
       if (res && (res as { success?: boolean }).success === false) {
         console.error(`GRVT respondió success=false al set_initial_leverage ${leverage}x para ${instrument}`);
-        return false;
+        return 'rejected';
       }
-      return true;
+      return 'ok';
     } catch (error) {
-      // ⚠️ DINERO REAL: distinguir un 404 (endpoint mal / problema de
-      // despliegue) de un rechazo de negocio (posición/órdenes abiertas,
-      // margin insuficiente, tier inválido). El caller usa el bool para
-      // fallar-cerrado; logueamos el error completo para diagnóstico — sin el
-      // cuerpo, un 404 se disfraza de regla de negocio (justo lo que pasó).
       const msg = error instanceof Error ? error.message : String(error);
+      // GRVT DEPRECATED the leverage-setting API entirely (HTTP 400 code 2106:
+      // "This API has been deprecated and can no longer be used to set
+      // leverage"). No replacement endpoint exists — leverage is now managed by
+      // GRVT (margin mode / UI). NOT a business rejection: surface it distinctly
+      // so the caller proceeds (bot sizes by notional + verifies via read-back)
+      // instead of aborting every start forever.
+      if (isDeprecatedLeverageError(msg)) {
+        console.warn(
+          `⚠️ GRVT deprecó la API de set_leverage (code 2106) para ${instrument}: ` +
+          `el leverage se gestiona en GRVT (margen/UI), no por API.`
+        );
+        return 'deprecated';
+      }
+      // ⚠️ DINERO REAL: distinguir un 404 (endpoint mal) de un rechazo de
+      // negocio. Logueamos el error completo — sin el cuerpo, un 404 se disfraza
+      // de regla de negocio (ya nos pasó).
       const is404 = /HTTP 404|\bnot found\b/i.test(msg);
       console.error(
         `Error estableciendo leverage ${leverage}x para ${instrument}` +
@@ -791,7 +816,7 @@ export class GRVTClient {
         msg,
         error
       );
-      return false;
+      return 'rejected';
     }
   }
 

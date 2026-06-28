@@ -1262,9 +1262,23 @@ export class GridEngine extends EventEmitter {
       );
     }
 
-    // Aplicar leverage. FAIL-CLOSED en fresh start; NON-FATAL en resume/restart.
-    const ok = await client.setLeverage(bot.pair, bot.leverage);
-    if (!ok) {
+    // Aplicar leverage. FAIL-CLOSED en fresh start; NON-FATAL en resume/restart
+    // y ante la DEPRECACIÓN de la API por parte de GRVT.
+    const result = await client.setLeverage(bot.pair, bot.leverage);
+    if (result === 'deprecated') {
+      // GRVT removió la API de set_leverage (code 2106). NO hay endpoint de
+      // reemplazo: el leverage lo gestiona GRVT (margin mode / UI). NO abortamos
+      // —si no, ningún bot arrancaría nunca más. El bot dimensiona por NOTIONAL
+      // (investment × leverage) igual, y el read-back de abajo sigue detectando
+      // un mismatch REAL cuando ya hay posición. El usuario debe fijar el
+      // margen/leverage deseado de ${bot.pair} directamente en GRVT.
+      log.warn(
+        `⚡ Bot ${botId}: GRVT deprecó la API de set_leverage (${bot.pair}). El leverage se gestiona en GRVT ` +
+        `(margen/UI); el bot dimensiona por NOTIONAL (× ${bot.leverage}x). Verificá el margen/leverage en GRVT. ` +
+        `Continuando con read-back de verificación.`
+      );
+      // cae al read-back (no fatal)
+    } else if (result === 'rejected') {
       if (isResume) {
         // RESUME/RESTART: GRVT rechazó set_leverage (lo más común: hay órdenes
         // abiertas en el instrumento). El leverage YA fue establecido en el
