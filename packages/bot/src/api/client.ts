@@ -760,21 +760,35 @@ export class GRVTClient {
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
 
     try {
-      await this.authedRequest(`${TRADING_URL}/set_leverage`, {
+      // GRVT's real endpoint is set_initial_leverage. /set_leverage does NOT
+      // exist and returns HTTP 404 — which the old catch surfaced as "GRVT
+      // rejected", disguising a wrong-endpoint bug as a business rejection and
+      // making EVERY fresh bot start fail. Confirmed against the official SDK
+      // (ApiSetInitialLeverageRequest: sub_account_id, instrument, leverage str).
+      const res = await this.authedRequest(`${TRADING_URL}/set_initial_leverage`, {
         sub_account_id: this.tradingAccountId,
         instrument: instrument,
         leverage: leverage.toString()
       });
+      // Trust the response, not just the absence of an exception: a 200 with
+      // success=false must NOT be read as "applied" (fail-closed on DINERO REAL).
+      if (res && (res as { success?: boolean }).success === false) {
+        console.error(`GRVT respondió success=false al set_initial_leverage ${leverage}x para ${instrument}`);
+        return false;
+      }
       return true;
     } catch (error) {
-      // ⚠️ DINERO REAL: GRVT puede rechazar el set_leverage (p.ej. posición
-      // abierta, margin insuficiente, tier inválido). El caller usa el bool
-      // para fallar-cerrado, pero SIN el cuerpo del error el operador no sabe
-      // POR QUÉ rechazó. Logueamos el error completo (no sólo .message) para
-      // diagnóstico. El tipo de retorno se mantiene boolean por compat.
+      // ⚠️ DINERO REAL: distinguir un 404 (endpoint mal / problema de
+      // despliegue) de un rechazo de negocio (posición/órdenes abiertas,
+      // margin insuficiente, tier inválido). El caller usa el bool para
+      // fallar-cerrado; logueamos el error completo para diagnóstico — sin el
+      // cuerpo, un 404 se disfraza de regla de negocio (justo lo que pasó).
+      const msg = error instanceof Error ? error.message : String(error);
+      const is404 = /HTTP 404|\bnot found\b/i.test(msg);
       console.error(
-        `Error estableciendo leverage ${leverage}x para ${instrument}:`,
-        error instanceof Error ? error.message : error,
+        `Error estableciendo leverage ${leverage}x para ${instrument}` +
+        (is404 ? ' (HTTP 404 — endpoint inexistente, NO un rechazo de negocio)' : '') + ':',
+        msg,
         error
       );
       return false;
