@@ -643,8 +643,14 @@ app.post('/api/bots/:id/leverage', async (req, res) => {
     // CONFIRMÓ el set_leverage. Si rechazó, devolvemos 502 y NO tocamos la DB
     // (de lo contrario la DB/dashboard mostrarían un leverage que GRVT nunca
     // aplicó y el bot operaría al leverage previo).
-    const ok = await client.setLeverage(bot.pair, leverage);
-    if (!ok) {
+    const result = await client.setLeverage(bot.pair, leverage);
+    if (result === 'deprecated') {
+      console.warn(`⚡ GRVT deprecó set_leverage por API (bot ${botId} -> ${leverage}x); DB no modificada`);
+      return res.status(409).json({
+        error: `GRVT deprecó el cambio de leverage por API (code 2106). Cambialo directamente en GRVT (margen/UI). La DB no fue modificada.`
+      });
+    }
+    if (result === 'rejected') {
       console.error(`⚡ GRVT rechazó set_leverage para bot ${botId} -> ${leverage}x (DB no modificada)`);
       return res.status(502).json({
         error: `GRVT rechazó el cambio de leverage a ${leverage}x. La DB no fue modificada. Revisá los logs del servidor para el motivo.`
